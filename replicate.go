@@ -195,6 +195,12 @@ func syncMetadata(source, target string) error {
 	if err := client.Get("repos/"+source+"/topics", &topics); err != nil {
 		return fmt.Errorf("read topics: %w", err)
 	}
+	var targetTopics struct { Names []string `json:"names"` }
+	if err := client.Get("repos/"+target+"/topics", &targetTopics); err != nil { return fmt.Errorf("read destination topics: %w", err) }
+	seen := make(map[string]bool)
+	for _, name := range topics.Names { seen[name] = true }
+	for _, name := range targetTopics.Names { if !seen[name] { topics.Names = append(topics.Names, name); seen[name] = true } }
+	if topics.Names == nil { topics.Names = []string{} }
 	if err := client.Put("repos/"+target+"/topics", jsonBody(topics), nil); err != nil {
 		return fmt.Errorf("update topics: %w", err)
 	}
@@ -204,6 +210,8 @@ func syncMetadata(source, target string) error {
 	for _, l := range labels {
 		path := "repos/" + target + "/labels/" + url.PathEscape(l.Name)
 		if err := client.Patch(path, jsonBody(l), nil); err != nil {
+			var apiErr *api.HTTPError
+			if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusNotFound { return fmt.Errorf("update label %q: %w", l.Name, err) }
 			if err := client.Post("repos/"+target+"/labels", jsonBody(l), nil); err != nil {
 				return fmt.Errorf("sync label %q: %w", l.Name, err)
 			}
@@ -252,11 +260,6 @@ func syncAssets(target string, src, dst release) error {
 			continue
 		}
 		fmt.Fprintf(os.Stderr, "    Replicating asset %s...\n", a.Name)
-		if d, ok := existing[a.Name]; ok {
-			if err := client.Delete(fmt.Sprintf("repos/%s/releases/assets/%d", target, d.ID), nil); err != nil {
-				return fmt.Errorf("replace asset %s: %w", a.Name, err)
-			}
-		}
 
 		tmp, err := os.CreateTemp("", "gh-replicate-asset-*")
 		if err != nil { return fmt.Errorf("create temporary asset file: %w", err) }
@@ -270,6 +273,12 @@ func syncAssets(target string, src, dst release) error {
 		if _, err := tmp.Seek(0, io.SeekStart); err != nil {
 			tmp.Close()
 			return fmt.Errorf("rewind asset %s: %w", a.Name, err)
+		}
+		if d, ok := existing[a.Name]; ok {
+			if err := client.Delete(fmt.Sprintf("repos/%s/releases/assets/%d", target, d.ID), nil); err != nil {
+				tmp.Close()
+				return fmt.Errorf("replace asset %s: %w", a.Name, err)
+			}
 		}
 		if err := uploadAsset(target, dst.ID, a.Name, tmp); err != nil {
 			tmp.Close()
