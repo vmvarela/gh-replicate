@@ -52,6 +52,61 @@ type asset struct {
 
 var client *api.RESTClient
 var httpClient *http.Client
+var repoPart = regexp.MustCompile(`^[A-Za-z0-9_.-]+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"mime"
+	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/cli/go-gh/v2/pkg/api"
+)
+
+type repository struct {
+	Description string `json:"description"`
+	Homepage    string `json:"homepage"`
+}
+
+type label struct {
+	Name        string `json:"name"`
+	Color       string `json:"color"`
+	Description string `json:"description"`
+}
+
+type release struct {
+	ID              int64   `json:"id"`
+	TagName         string  `json:"tag_name"`
+	TargetCommitish string  `json:"target_commitish"`
+	Name            string  `json:"name"`
+	Body            string  `json:"body"`
+	Draft           bool    `json:"draft"`
+	Prerelease      bool    `json:"prerelease"`
+	Assets          []asset `json:"assets"`
+}
+
+type asset struct {
+	ID     int64  `json:"id"`
+	Name   string `json:"name"`
+	Size   int64  `json:"size"`
+	Digest string `json:"digest"`
+	URL    string `json:"url"`
+}
+
+var client *api.RESTClient
+var httpClient *http.Client
+)
 var nextLink = regexp.MustCompile(`<([^>]+)>;\s*rel="next"`)
 
 func run(args []string) error {
@@ -69,6 +124,7 @@ func run(args []string) error {
 	}
 
 	source, target := args[0], args[1]
+	if strings.EqualFold(source, target) { return errors.New("source and target must be different repositories") }
 	if !validRepo(source) || !validRepo(target) {
 		return errors.New("repositories must use OWNER/REPO format")
 	}
@@ -87,7 +143,7 @@ func run(args []string) error {
 
 func validRepo(s string) bool {
 	p := strings.Split(s, "/")
-	return len(p) == 2 && p[0] != "" && p[1] != ""
+	return len(p) == 2 && repoPart.MatchString(p[0]) && repoPart.MatchString(p[1]) && p[0] != "." && p[0] != ".." && p[1] != "." && p[1] != ".."
 }
 
 func ensureRepository(repo string) error {
@@ -233,6 +289,7 @@ func downloadAsset(path string, dst io.Writer) error {
 	resp, err := httpClient.Do(req)
 	if err != nil { return err }
 	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 { return fmt.Errorf("asset request failed: HTTP %d", resp.StatusCode) }
 	_, err = io.Copy(dst, resp.Body)
 	return err
 }
@@ -244,22 +301,23 @@ func uploadAsset(target string, releaseID int64, name string, src *os.File) erro
 	contentType := mime.TypeByExtension(filepath.Ext(name))
 	if contentType == "" { contentType = "application/octet-stream" }
 
-	path := fmt.Sprintf("repos/%s/releases/%d/assets?name=%s", target, releaseID, url.QueryEscape(name))
+	path := fmt.Sprintf("https://uploads.github.com/repos/%s/releases/%d/assets?name=%s", target, releaseID, url.QueryEscape(name))
 	req, err := http.NewRequest(http.MethodPost, path, src)
 	if err != nil { return err }
 	req.Header.Set("Content-Type", contentType)
 	req.ContentLength = stat.Size()
 
-	resp, err := client.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil { return err }
 	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 { return fmt.Errorf("asset request failed: HTTP %d", resp.StatusCode) }
 	_, err = io.Copy(io.Discard, resp.Body)
 	return err
 }
 
 func sameAsset(a, b asset) bool {
 	if a.Digest != "" && b.Digest != "" { return a.Digest == b.Digest }
-	return a.Size == b.Size
+	return false
 }
 
 func getAll[T any](path string) ([]T, error) {
