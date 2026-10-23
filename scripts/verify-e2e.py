@@ -59,7 +59,7 @@ labels = {x["name"]: x for x in pages(f"repos/{target}/labels")}
 for label in pages(f"repos/{source}/labels"):
     assert label["name"] in labels
     for key in ("color", "description"):
-        assert label[key] == labels[label["name"]][key], f"Label {label['name']}: {key}"
+        assert (label[key] or "") == (labels[label["name"]][key] or ""), f"Label {label['name']}: {key}: {label[key]!r} != {labels[label['name']][key]!r}"
 
 def refs(repo):
     output = subprocess.check_output(["git", "ls-remote", "--heads", "--tags", f"https://github.com/{repo}.git"], text=True)
