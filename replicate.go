@@ -257,7 +257,7 @@ func uploadAsset(target string, releaseID int64, name string, src *os.File) erro
 	if contentType == "" { contentType = "application/octet-stream" }
 
 	path := fmt.Sprintf("https://uploads.github.com/repos/%s/releases/%d/assets?name=%s", target, releaseID, url.QueryEscape(name))
-	req, err := http.NewRequest(http.MethodPost, path, src)
+	req, err := http.NewRequest(http.MethodPost, path, io.LimitReader(src, stat.Size()))
 	if err != nil { return err }
 	req.Header.Set("Content-Type", contentType)
 	req.ContentLength = stat.Size()

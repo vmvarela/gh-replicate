@@ -43,6 +43,8 @@ func TestUploadAsset(t *testing.T) {
   httpClient=&http.Client{Transport:transportFunc(func(r *http.Request)(*http.Response,error){
    if r.URL.Host!="uploads.github.com" || r.URL.Path!="/repos/a/b/releases/123/assets" || r.URL.Query().Get("name")!="file +.zip" {t.Errorf("wrong upload URL: %s",r.URL)}
    if r.Method!="POST" || r.ContentLength!=6 {t.Error("wrong upload request")}
+   if _,err:=io.ReadAll(r.Body);err!=nil {t.Error(err)}
+   if err:=r.Body.Close();err!=nil {t.Error(err)}
    return &http.Response{StatusCode:status,Body:io.NopCloser(strings.NewReader("{}")),Header:make(http.Header)},nil
   })}
   err=uploadAsset("a/b",123,"file +.zip",f)
