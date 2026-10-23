@@ -1,0 +1,34 @@
+name: Replication E2E
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: Source repository (OWNER/REPO)
+        required: true
+        default: vmvarela/sql-pipe
+      target:
+        description: Target repository (OWNER/REPO)
+        required: true
+        default: vmvarela/sql-pipe-replica
+
+permissions:
+  contents: read
+
+jobs:
+  replicate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.3'
+          cache: true
+      - name: Build extension
+        run: go build -o gh-replicate .
+      - name: Replicate repository
+        env:
+          GH_TOKEN: ${{ secrets.REPLICATION_TOKEN }}
+          SOURCE_REPOSITORY: ${{ inputs.source }}
+          TARGET_REPOSITORY: ${{ inputs.target }}
+        run: ./gh-replicate "$SOURCE_REPOSITORY" "$TARGET_REPOSITORY"
