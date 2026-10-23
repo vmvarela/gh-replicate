@@ -32,6 +32,6 @@ jobs:
       - name: Replicate repository
         env:
           GH_TOKEN: ${{ secrets.REPLICATION_TOKEN }}
-          SOURCE_REPOSITORY: ${{ inputs.source }}
-          TARGET_REPOSITORY: ${{ inputs.target }}
+          SOURCE_REPOSITORY: ${{ inputs.source || 'vmvarela/sql-pipe' }}
+          TARGET_REPOSITORY: ${{ inputs.target || 'vmvarela/sql-pipe-replica' }}
         run: ./gh-replicate "$SOURCE_REPOSITORY" "$TARGET_REPOSITORY"
