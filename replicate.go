@@ -66,11 +66,17 @@ func run(args []string) error {
 	if !validRepo(source) || !validRepo(target) {
 		return errors.New("repositories must use OWNER/REPO format")
 	}
+	fmt.Fprintln(os.Stderr, "Checking repositories...")
 	if err := ensureRepository(source); err != nil { return err }
 	if err := ensureRepository(target); err != nil { return err }
+	fmt.Fprintln(os.Stderr, "Replicating Git refs...")
 	if err := syncGit(source, target); err != nil { return err }
+	fmt.Fprintln(os.Stderr, "Replicating repository metadata and labels...")
 	if err := syncMetadata(source, target); err != nil { return err }
-	return syncReleases(source, target)
+	fmt.Fprintln(os.Stderr, "Replicating releases...")
+	if err := syncReleases(source, target); err != nil { return err }
+	fmt.Fprintln(os.Stderr, "Replication complete.")
+	return nil
 }
 
 func validRepo(s string) bool {
@@ -92,15 +98,18 @@ func syncGit(source, target string) error {
 	defer os.RemoveAll(dir)
 
 	gitDir := filepath.Join(dir, "repo.git")
+	fmt.Fprintf(os.Stderr, "  Cloning %s...\n", source)
 	if err := command("", "gh", "repo", "clone", source, gitDir, "--", "--bare"); err != nil {
 		return fmt.Errorf("clone source: %w", err)
 	}
 	if err := command(gitDir, "git", "remote", "add", "replicate-target", "https://github.com/"+target+".git"); err != nil {
 		return fmt.Errorf("add destination remote: %w", err)
 	}
+	fmt.Fprintln(os.Stderr, "  Configuring Git authentication...")
 	if err := command(gitDir, "gh", "auth", "setup-git"); err != nil {
 		return fmt.Errorf("configure Git authentication: %w", err)
 	}
+	fmt.Fprintf(os.Stderr, "  Pushing branches and tags to %s...\n", target)
 	if err := command(gitDir, "git", "push", "--force", "replicate-target",
 		"refs/heads/*:refs/heads/*", "refs/tags/*:refs/tags/*"); err != nil {
 		return fmt.Errorf("push refs: %w", err)
@@ -151,6 +160,7 @@ func syncReleases(source, target string) error {
 	for _, r := range targetReleases { byTag[r.TagName] = r }
 
 	for _, src := range sourceReleases {
+		fmt.Fprintf(os.Stderr, "  Release %s...\n", src.TagName)
 		dst, exists := byTag[src.TagName]
 		payload := map[string]any{
 			"tag_name": src.TagName, "target_commitish": src.TargetCommitish,
@@ -175,7 +185,11 @@ func syncAssets(target string, src, dst release) error {
 	for _, a := range dst.Assets { existing[a.Name] = a }
 
 	for _, a := range src.Assets {
-		if d, ok := existing[a.Name]; ok && sameAsset(a, d) { continue }
+		if d, ok := existing[a.Name]; ok && sameAsset(a, d) {
+			fmt.Fprintf(os.Stderr, "    Asset %s unchanged.\n", a.Name)
+			continue
+		}
+		fmt.Fprintf(os.Stderr, "    Replicating asset %s...\n", a.Name)
 		if d, ok := existing[a.Name]; ok {
 			if err := client.Delete(fmt.Sprintf("repos/%s/releases/assets/%d", target, d.ID), nil); err != nil {
 				return fmt.Errorf("replace asset %s: %w", a.Name, err)
