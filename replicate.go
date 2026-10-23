@@ -39,7 +39,7 @@ type label struct {
 	Description string `json:"description"`
 }
 
-func run(args []string) error {
+var client *api.RESTClient\n\nfunc run(args []string) error {\n\tvar err error\n\tclient, err = api.DefaultRESTClient()\n\tif err != nil { return fmt.Errorf("create GitHub client: %w", err) }
 	if len(args) != 2 { return errors.New("usage: gh replicate SOURCE TARGET") }
 	source, target := args[0], args[1]
 	if !validRepo(source) || !validRepo(target) { return errors.New("repositories must use OWNER/REPO format") }
@@ -53,7 +53,8 @@ func validRepo(s string) bool {
 	return len(p) == 2 && p[0] != "" && p[1] != ""
 }
 func ensureRepository(repo string) error {
-	if _, err := ghAPI("GET", "repos/"+repo, nil); err != nil { return fmt.Errorf("access repository %s: %w", repo, err) }
+	var r repository
+	if err := client.Get("repos/"+repo, &r); err != nil { return fmt.Errorf("access repository %s: %w", repo, err) }
 	return nil
 }
 func syncGit(source, target string) error {
@@ -70,10 +71,10 @@ func syncGit(source, target string) error {
 func syncMetadata(source, target string) error {
 	var repo repository
 	if err := getJSON("repos/"+source, &repo); err != nil { return fmt.Errorf("read repository metadata: %w", err) }
-	if _, err := ghAPI("PATCH", "repos/"+target, map[string]any{"description": repo.Description, "homepage": repo.Homepage}); err != nil { return fmt.Errorf("update repository metadata: %w", err) }
+	if err := client.Patch("repos/"+target, jsonBody(map[string]any{"description": repo.Description, "homepage": repo.Homepage}), nil); err != nil { return fmt.Errorf("update repository metadata: %w", err) }
 	var topics struct { Names []string `json:"names"` }
 	if err := getJSON("repos/"+source+"/topics", &topics); err != nil { return fmt.Errorf("read topics: %w", err) }
-	if _, err := ghAPI("PUT", "repos/"+target+"/topics", topics); err != nil { return fmt.Errorf("update topics: %w", err) }
+	if err := client.Put("repos/"+target+"/topics", jsonBody(topics), nil); err != nil { return fmt.Errorf("update topics: %w", err) }
 	var labels []label
 	if err := getJSON("repos/"+source+"/labels?per_page=100", &labels); err != nil { return fmt.Errorf("read labels: %w", err) }
 	for _, l := range labels {
@@ -96,13 +97,9 @@ func syncReleases(source, target string) error {
 		dst, exists := byTag[src.TagName]
 		payload := map[string]any{"tag_name": src.TagName, "target_commitish": src.TargetCommitish, "name": src.Name, "body": src.Body, "draft": src.Draft, "prerelease": src.Prerelease}
 		if exists {
-			data, err := ghAPI("PATCH", fmt.Sprintf("repos/%s/releases/%d", target, dst.ID), payload)
-			if err != nil { return fmt.Errorf("update release %s: %w", src.TagName, err) }
-			if err := json.Unmarshal(data, &dst); err != nil { return err }
+			if err := client.Patch(fmt.Sprintf("repos/%s/releases/%d", target, dst.ID), jsonBody(payload), &dst); err != nil { return fmt.Errorf("update release %s: %w", src.TagName, err) }
 		} else {
-			data, err := ghAPI("POST", "repos/"+target+"/releases", payload)
-			if err != nil { return fmt.Errorf("create release %s: %w", src.TagName, err) }
-			if err := json.Unmarshal(data, &dst); err != nil { return err }
+			if err := client.Post("repos/"+target+"/releases", jsonBody(payload), &dst); err != nil { return fmt.Errorf("create release %s: %w", src.TagName, err) }
 		}
 		if err := syncAssets(source, target, src, dst); err != nil { return err }
 	}
@@ -115,7 +112,7 @@ func syncAssets(source, target string, src, dst release) error {
 	for _, a := range src.Assets {
 		if d, ok := existing[a.Name]; ok && sameAsset(a, d) { continue }
 		if d, ok := existing[a.Name]; ok {
-			if _, err := ghAPI("DELETE", fmt.Sprintf("repos/%s/releases/assets/%d", target, d.ID), nil); err != nil { return fmt.Errorf("replace asset %s: %w", a.Name, err) }
+			if err := client.Delete(fmt.Sprintf("repos/%s/releases/assets/%d", target, d.ID), nil); err != nil { return fmt.Errorf("replace asset %s: %w", a.Name, err) }
 		}
 		tmp, err := os.CreateTemp("", "gh-replicate-asset-*")
 		if err != nil { return err }
