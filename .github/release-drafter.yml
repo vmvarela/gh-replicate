@@ -1,13 +1,13 @@
 name-template: 'v$RESOLVED_VERSION'
 tag-template: 'v$RESOLVED_VERSION'
+
 version-resolver:
-  major:
-    labels: [breaking]
   minor:
     labels: [enhancement]
   patch:
-    labels: [bug, documentation, dependencies]
+    labels: [bug, documentation]
   default: patch
+
 categories:
   - title: Added
     labels: [enhancement]
@@ -15,8 +15,9 @@ categories:
     labels: [bug]
   - title: Documentation
     labels: [documentation]
-  - title: Dependencies
-    labels: [dependencies]
+  - title: Other Changes
+    labels: ['*']
+
 change-template: '- $TITLE (#$NUMBER) @$AUTHOR'
 template: |
   $CHANGES
