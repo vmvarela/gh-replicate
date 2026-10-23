@@ -1,3 +1,3 @@
 module github.com/vmvarela/gh-replicate
 
-go 1.24
+go 1.27
