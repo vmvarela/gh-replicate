@@ -52,61 +52,7 @@ type asset struct {
 
 var client *api.RESTClient
 var httpClient *http.Client
-var repoPart = regexp.MustCompile(`^[A-Za-z0-9_.-]+package main
-
-import (
-	"bytes"
-	"context"
-	"encoding/json"
-	"errors"
-	"fmt"
-	"io"
-	"mime"
-	"net/http"
-	"net/url"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"regexp"
-	"strings"
-	"time"
-
-	"github.com/cli/go-gh/v2/pkg/api"
-)
-
-type repository struct {
-	Description string `json:"description"`
-	Homepage    string `json:"homepage"`
-}
-
-type label struct {
-	Name        string `json:"name"`
-	Color       string `json:"color"`
-	Description string `json:"description"`
-}
-
-type release struct {
-	ID              int64   `json:"id"`
-	TagName         string  `json:"tag_name"`
-	TargetCommitish string  `json:"target_commitish"`
-	Name            string  `json:"name"`
-	Body            string  `json:"body"`
-	Draft           bool    `json:"draft"`
-	Prerelease      bool    `json:"prerelease"`
-	Assets          []asset `json:"assets"`
-}
-
-type asset struct {
-	ID     int64  `json:"id"`
-	Name   string `json:"name"`
-	Size   int64  `json:"size"`
-	Digest string `json:"digest"`
-	URL    string `json:"url"`
-}
-
-var client *api.RESTClient
-var httpClient *http.Client
-)
+var repoPart = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
 var nextLink = regexp.MustCompile(`<([^>]+)>;\s*rel="next"`)
 
 func run(args []string) error {
