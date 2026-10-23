@@ -2,6 +2,8 @@ name: Replication E2E
 
 on:
   workflow_dispatch:
+  pull_request:
+    types: [labeled]
     inputs:
       source:
         description: Source repository (OWNER/REPO)
@@ -17,6 +19,7 @@ permissions:
 
 jobs:
   replicate:
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'run-e2e'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
