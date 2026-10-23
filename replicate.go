@@ -51,6 +51,7 @@ type asset struct {
 }
 
 var client *api.RESTClient
+var httpClient *http.Client
 var nextLink = regexp.MustCompile(`<([^>]+)>;\s*rel="next"`)
 
 func run(args []string) error {
@@ -60,7 +61,11 @@ func run(args []string) error {
 	var err error
 	client, err = api.DefaultRESTClient()
 	if err != nil {
-		return fmt.Errorf("create GitHub client: %w", err)
+		return fmt.Errorf("create GitHub REST client: %w", err)
+	}
+	httpClient, err = api.DefaultHTTPClient()
+	if err != nil {
+		return fmt.Errorf("create GitHub HTTP client: %w", err)
 	}
 
 	source, target := args[0], args[1]
@@ -225,7 +230,7 @@ func downloadAsset(path string, dst io.Writer) error {
 	if err != nil { return err }
 	req.Header.Set("Accept", "application/octet-stream")
 
-	resp, err := client.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil { return err }
 	defer resp.Body.Close()
 	_, err = io.Copy(dst, resp.Body)
