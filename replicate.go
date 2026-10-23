@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"os"
@@ -196,25 +197,59 @@ func syncAssets(target string, src, dst release) error {
 			}
 		}
 
-		data, err := downloadAsset(a.URL)
-		if err != nil { return fmt.Errorf("download asset %s: %w", a.Name, err) }
 		tmp, err := os.CreateTemp("", "gh-replicate-asset-*")
-		if err != nil { return err }
+		if err != nil { return fmt.Errorf("create temporary asset file: %w", err) }
 		name := tmp.Name()
-		if _, err = tmp.Write(data); err != nil { tmp.Close(); os.Remove(name); return err }
-		if err = tmp.Close(); err != nil { os.Remove(name); return err }
-		err = command("", "gh", "release", "upload", src.TagName, name+"#"+a.Name, "--repo", target)
+		defer os.Remove(name)
+
+		if err := downloadAsset(a.URL, tmp); err != nil {
+			tmp.Close()
+			return fmt.Errorf("download asset %s: %w", a.Name, err)
+		}
+		if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+			tmp.Close()
+			return fmt.Errorf("rewind asset %s: %w", a.Name, err)
+		}
+		if err := uploadAsset(target, dst.ID, a.Name, tmp); err != nil {
+			tmp.Close()
+			return fmt.Errorf("upload asset %s: %w", a.Name, err)
+		}
+		if err := tmp.Close(); err != nil { return fmt.Errorf("close asset %s: %w", a.Name, err) }
 		os.Remove(name)
-		if err != nil { return fmt.Errorf("upload asset %s: %w", a.Name, err) }
 	}
 	return nil
 }
 
-func downloadAsset(path string) ([]byte, error) {
-	resp, err := client.Request(http.MethodGet, path, nil)
-	if err != nil { return nil, err }
+func downloadAsset(path string, dst io.Writer) error {
+	req, err := http.NewRequest(http.MethodGet, path, nil)
+	if err != nil { return err }
+	req.Header.Set("Accept", "application/octet-stream")
+
+	resp, err := client.Do(req)
+	if err != nil { return err }
 	defer resp.Body.Close()
-	return io.ReadAll(resp.Body)
+	_, err = io.Copy(dst, resp.Body)
+	return err
+}
+
+func uploadAsset(target string, releaseID int64, name string, src *os.File) error {
+	stat, err := src.Stat()
+	if err != nil { return err }
+
+	contentType := mime.TypeByExtension(filepath.Ext(name))
+	if contentType == "" { contentType = "application/octet-stream" }
+
+	path := fmt.Sprintf("repos/%s/releases/%d/assets?name=%s", target, releaseID, url.QueryEscape(name))
+	req, err := http.NewRequest(http.MethodPost, path, src)
+	if err != nil { return err }
+	req.Header.Set("Content-Type", contentType)
+	req.ContentLength = stat.Size()
+
+	resp, err := client.Do(req)
+	if err != nil { return err }
+	defer resp.Body.Close()
+	_, err = io.Copy(io.Discard, resp.Body)
+	return err
 }
 
 func sameAsset(a, b asset) bool {
