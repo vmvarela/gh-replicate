@@ -16,6 +16,23 @@ type repository struct {
 	Description string `json:"description"`
 	Homepage string `json:"homepage"`
 }
+
+type release struct {
+	ID int64 `json:"id"`
+	TagName string `json:"tag_name"`
+	TargetCommitish string `json:"target_commitish"`
+	Name string `json:"name"`
+	Body string `json:"body"`
+	Draft bool `json:"draft"`
+	Prerelease bool `json:"prerelease"`
+	Assets []asset `json:"assets"`
+}
+type asset struct {
+	Name string `json:"name"`
+	Size int64 `json:"size"`
+	Digest string `json:"digest"`
+	URL string `json:"url"`
+}
 type label struct {
 	Name string `json:"name"`
 	Color string `json:"color"`
@@ -29,7 +46,7 @@ func run(args []string) error {
 	if err := ensureRepository(source); err != nil { return err }
 	if err := ensureRepository(target); err != nil { return err }
 	if err := syncGit(source, target); err != nil { return err }
-	return syncMetadata(source, target)
+	if err := syncMetadata(source, target); err != nil { return err }\n\treturn syncReleases(source, target)
 }
 func validRepo(s string) bool {
 	p := strings.Split(s, "/")
@@ -67,6 +84,68 @@ func syncMetadata(source, target string) error {
 	}
 	return nil
 }
+
+func syncReleases(source, target string) error {
+	var sourceReleases, targetReleases []release
+	if err := getJSON("repos/"+source+"/releases?per_page=100", &sourceReleases); err != nil { return fmt.Errorf("read releases: %w", err) }
+	if err := getJSON("repos/"+target+"/releases?per_page=100", &targetReleases); err != nil { return fmt.Errorf("read destination releases: %w", err) }
+	byTag := make(map[string]release, len(targetReleases))
+	for _, r := range targetReleases { byTag[r.TagName] = r }
+
+	for _, src := range sourceReleases {
+		dst, exists := byTag[src.TagName]
+		payload := map[string]any{"tag_name": src.TagName, "target_commitish": src.TargetCommitish, "name": src.Name, "body": src.Body, "draft": src.Draft, "prerelease": src.Prerelease}
+		if exists {
+			data, err := ghAPI("PATCH", fmt.Sprintf("repos/%s/releases/%d", target, dst.ID), payload)
+			if err != nil { return fmt.Errorf("update release %s: %w", src.TagName, err) }
+			if err := json.Unmarshal(data, &dst); err != nil { return err }
+		} else {
+			data, err := ghAPI("POST", "repos/"+target+"/releases", payload)
+			if err != nil { return fmt.Errorf("create release %s: %w", src.TagName, err) }
+			if err := json.Unmarshal(data, &dst); err != nil { return err }
+		}
+		if err := syncAssets(source, target, src, dst); err != nil { return err }
+	}
+	return nil
+}
+
+func syncAssets(source, target string, src, dst release) error {
+	existing := make(map[string]asset, len(dst.Assets))
+	for _, a := range dst.Assets { existing[a.Name] = a }
+	for _, a := range src.Assets {
+		if d, ok := existing[a.Name]; ok && sameAsset(a, d) { continue }
+		if d, ok := existing[a.Name]; ok {
+			if _, err := ghAPI("DELETE", fmt.Sprintf("repos/%s/releases/assets/%d", target, assetID(dst.Assets, d.Name)), nil); err != nil { return fmt.Errorf("replace asset %s: %w", a.Name, err) }
+		}
+		tmp, err := os.CreateTemp("", "gh-replicate-asset-*")
+		if err != nil { return err }
+		name := tmp.Name()
+		tmp.Close()
+		defer os.Remove(name)
+		if err := command("", "gh", "api", "-H", "Accept: application/octet-stream", a.URL, ">", name); err != nil {
+			// gh does not interpret shell redirection; download through stdout instead.
+			cmd := exec.Command("gh", "api", "-H", "Accept: application/octet-stream", a.URL)
+			data, downloadErr := cmd.Output()
+			if downloadErr != nil { return fmt.Errorf("download asset %s: %w", a.Name, downloadErr) }
+			if writeErr := os.WriteFile(name, data, 0600); writeErr != nil { return writeErr }
+		}
+		if err := command("", "gh", "release", "upload", src.TagName, name+"#"+a.Name, "--repo", target); err != nil { return fmt.Errorf("upload asset %s: %w", a.Name, err) }
+		os.Remove(name)
+	}
+	return nil
+}
+
+func sameAsset(a, b asset) bool {
+	if a.Digest != "" && b.Digest != "" { return a.Digest == b.Digest }
+	return a.Size == b.Size
+}
+
+func assetID(assets []asset, name string) int64 {
+	// Asset IDs are only needed when replacing a changed same-name asset.
+	// Fetching the release again keeps the public model intentionally small.
+	return 0
+}
+
 func getJSON(path string, out any) error {
 	data, err := ghAPI("GET", path, nil)
 	if err != nil { return err }
