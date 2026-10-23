@@ -115,61 +115,20 @@ func syncAssets(source, target string, src, dst release) error {
 	for _, a := range src.Assets {
 		if d, ok := existing[a.Name]; ok && sameAsset(a, d) { continue }
 		if d, ok := existing[a.Name]; ok {
-			if _, err := ghAPI("DELETE", fmt.Sprintf("repos/%s/releases/assets/%d", target, assetID(dst.Assets, d.Name)), nil); err != nil { return fmt.Errorf("replace asset %s: %w", a.Name, err) }
+			if _, err := ghAPI("DELETE", fmt.Sprintf("repos/%s/releases/assets/%d", target, d.ID), nil); err != nil { return fmt.Errorf("replace asset %s: %w", a.Name, err) }
 		}
 		tmp, err := os.CreateTemp("", "gh-replicate-asset-*")
 		if err != nil { return err }
 		name := tmp.Name()
 		tmp.Close()
-		defer os.Remove(name)
-		if err := command("", "gh", "api", "-H", "Accept: application/octet-stream", a.URL, ">", name); err != nil {
-			// gh does not interpret shell redirection; download through stdout instead.
-			cmd := exec.Command("gh", "api", "-H", "Accept: application/octet-stream", a.URL)
-			data, downloadErr := cmd.Output()
-			if downloadErr != nil { return fmt.Errorf("download asset %s: %w", a.Name, downloadErr) }
-			if writeErr := os.WriteFile(name, data, 0600); writeErr != nil { return writeErr }
-		}
-		if err := command("", "gh", "release", "upload", src.TagName, name+"#"+a.Name, "--repo", target); err != nil { return fmt.Errorf("upload asset %s: %w", a.Name, err) }
+		cmd := exec.Command("gh", "api", "-H", "Accept: application/octet-stream", a.URL)
+		data, err := cmd.Output()
+		if err != nil { os.Remove(name); return fmt.Errorf("download asset %s: %w", a.Name, err) }
+		if err := os.WriteFile(name, data, 0600); err != nil { os.Remove(name); return err }
+		err = command("", "gh", "release", "upload", src.TagName, name+"#"+a.Name, "--repo", target)
 		os.Remove(name)
+		if err != nil { return fmt.Errorf("upload asset %s: %w", a.Name, err) }
 	}
 	return nil
 }
 
-func sameAsset(a, b asset) bool {
-	if a.Digest != "" && b.Digest != "" { return a.Digest == b.Digest }
-	return a.Size == b.Size
-}
-
-func assetID(assets []asset, name string) int64 {
-	// Asset IDs are only needed when replacing a changed same-name asset.
-	// Fetching the release again keeps the public model intentionally small.
-	return 0
-}
-
-func getJSON(path string, out any) error {
-	data, err := ghAPI("GET", path, nil)
-	if err != nil { return err }
-	return json.Unmarshal(data, out)
-}
-func ghAPI(method, path string, body any) ([]byte, error) {
-	args := []string{"api", "--method", method, path}
-	var stdin []byte
-	if body != nil {
-		var err error
-		stdin, err = json.Marshal(body)
-		if err != nil { return nil, err }
-		args = append(args, "--input", "-")
-	}
-	cmd := exec.Command("gh", args...)
-	if stdin != nil { cmd.Stdin = bytes.NewReader(stdin) }
-	out, err := cmd.CombinedOutput()
-	if err != nil { return nil, fmt.Errorf("%s: %w", strings.TrimSpace(string(out)), err) }
-	return out, nil
-}
-func command(dir, name string, args ...string) error {
-	cmd := exec.Command(name, args...)
-	cmd.Dir = dir
-	out, err := cmd.CombinedOutput()
-	if err != nil { return fmt.Errorf("%s: %w", strings.TrimSpace(string(out)), err) }
-	return nil
-}
