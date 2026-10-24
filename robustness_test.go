@@ -41,6 +41,29 @@ func fakeAPI(t *testing.T, handler http.HandlerFunc) *replicator {
 	return &replicator{client: c, httpClient: h, ctx: context.Background(), timeout: time.Minute}
 }
 
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	old := os.Stderr
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = writer
+	defer func() {
+		os.Stderr = old
+		writer.Close()
+		reader.Close()
+	}()
+	fn()
+	writer.Close()
+	os.Stderr = old
+	out, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(out)
+}
+
 func TestPagination(t *testing.T) {
 	calls := 0
 	r := fakeAPI(t, func(w http.ResponseWriter, req *http.Request) {
@@ -97,8 +120,13 @@ func TestDryRunMakesNoWrites(t *testing.T) {
 	if err := r.syncMetadata("a/b", p); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.syncReleases("a/b", p); err != nil {
-		t.Fatal(err)
+	out := captureStderr(t, func() {
+		if err := r.syncReleases("a/b", p); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if strings.Contains(out, "/releases/0") || !strings.Contains(out, "Latest to release v1") {
+		t.Fatalf("misleading dry-run output: %q", out)
 	}
 }
 
@@ -298,12 +326,108 @@ func TestVerifyDownloadedAsset(t *testing.T) {
 	if _, err := f.WriteString("abc"); err != nil {
 		t.Fatal(err)
 	}
-	a := asset{Name: "binary", Size: 3, Digest: "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"}
-	if err := verifyAsset(f, a); err != nil {
+	a := asset{Name: "binary", Size: 3, Digest: assetDigest("abc")}
+	digest, err := verifyAsset(f, a)
+	if err != nil {
 		t.Fatal(err)
 	}
+	if digest != a.Digest {
+		t.Fatalf("digest %q, want %q", digest, a.Digest)
+	}
 	a.Size = 4
-	if err := verifyAsset(f, a); err == nil {
+	if _, err := verifyAsset(f, a); err == nil {
 		t.Fatal("accepted truncated download")
+	}
+}
+
+func TestMissingDigestsPreserveAsset(t *testing.T) {
+	var methods []string
+	r := fakeAPI(t, func(w http.ResponseWriter, req *http.Request) {
+		methods = append(methods, req.Method+" "+req.URL.Path)
+		switch req.URL.Path {
+		case "/source", "/dest":
+			fmt.Fprint(w, "abc")
+		default:
+			t.Errorf("unexpected request: %s %s", req.Method, req.URL.Path)
+		}
+	})
+	src := release{Assets: []asset{{Name: "binary", Size: 3, URL: "https://api.github.com/source"}}}
+	dst := release{ID: 1, Assets: []asset{{ID: 2, Name: "binary", Size: 3, URL: "https://api.github.com/dest"}}}
+	if err := r.syncAssets("a/b", src, dst); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"GET /source", "GET /dest"}
+	if !reflect.DeepEqual(methods, want) {
+		t.Fatalf("requests %v, want %v", methods, want)
+	}
+}
+
+func TestSameSizeDifferentContentReplacesAsset(t *testing.T) {
+	var methods []string
+	r := fakeAPI(t, func(w http.ResponseWriter, req *http.Request) {
+		methods = append(methods, req.Method+" "+req.URL.Path)
+		switch req.Method + " " + req.URL.Path {
+		case "GET /source":
+			fmt.Fprint(w, "abc")
+		case "GET /dest":
+			fmt.Fprint(w, "xyz")
+		case "DELETE /repos/a/b/releases/assets/2":
+			fmt.Fprint(w, "{}")
+		case "POST /repos/a/b/releases/1/assets":
+			fmt.Fprintf(w, `{"size":3,"digest":%q}`, assetDigest("abc"))
+		default:
+			t.Errorf("unexpected request: %s %s", req.Method, req.URL.Path)
+		}
+	})
+	src := release{Assets: []asset{{Name: "binary", Size: 3, URL: "https://api.github.com/source"}}}
+	dst := release{ID: 1, Assets: []asset{{ID: 2, Name: "binary", Size: 3, URL: "https://api.github.com/dest"}}}
+	if err := r.syncAssets("a/b", src, dst); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"GET /source", "GET /dest", "DELETE /repos/a/b/releases/assets/2", "POST /repos/a/b/releases/1/assets"}
+	if !reflect.DeepEqual(methods, want) {
+		t.Fatalf("requests %v, want %v", methods, want)
+	}
+}
+
+func TestDestinationDigestSkipsDownload(t *testing.T) {
+	calls := 0
+	r := fakeAPI(t, func(w http.ResponseWriter, req *http.Request) {
+		calls++
+		if req.URL.Path != "/source" {
+			t.Errorf("unexpected request: %s %s", req.Method, req.URL.Path)
+		}
+		fmt.Fprint(w, "abc")
+	})
+	src := release{Assets: []asset{{Name: "binary", Size: 3, URL: "https://api.github.com/source"}}}
+	dst := release{ID: 1, Assets: []asset{{ID: 2, Name: "binary", Size: 3, Digest: assetDigest("abc"), URL: "https://api.github.com/dest"}}}
+	if err := r.syncAssets("a/b", src, dst); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("destination was downloaded %d times", calls-1)
+	}
+}
+
+func TestDestinationReadErrorPreservesAsset(t *testing.T) {
+	writes := 0
+	r := fakeAPI(t, func(w http.ResponseWriter, req *http.Request) {
+		switch {
+		case req.Method == http.MethodGet && req.URL.Path == "/source":
+			fmt.Fprint(w, "abc")
+		case req.Method == http.MethodGet && req.URL.Path == "/dest":
+			w.WriteHeader(http.StatusInternalServerError)
+		default:
+			writes++
+		}
+	})
+	src := release{Assets: []asset{{Name: "binary", Size: 3, URL: "https://api.github.com/source"}}}
+	dst := release{ID: 1, Assets: []asset{{ID: 2, Name: "binary", Size: 3, URL: "https://api.github.com/dest"}}}
+	err := r.syncAssets("a/b", src, dst)
+	if err == nil || !strings.Contains(err.Error(), "compare asset") {
+		t.Fatalf("expected comparison error, got %v", err)
+	}
+	if writes != 0 {
+		t.Fatalf("failed comparison caused %d writes", writes)
 	}
 }

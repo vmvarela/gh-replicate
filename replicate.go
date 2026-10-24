@@ -303,7 +303,9 @@ func (r *replicator) syncReleases(target string, p *plan) error {
 		if !ok {
 			return fmt.Errorf("source Latest %q is absent from release snapshot; rerun", p.latest)
 		}
-		if err := r.call("PATCH", fmt.Sprintf("repos/%s/releases/%d", target, dst.ID), jsonBody(map[string]string{"make_latest": "true"}), nil); err != nil {
+		if r.dryRun {
+			fmt.Fprintf(os.Stderr, "  Would set Latest to release %s after reconciliation\n", p.latest)
+		} else if err := r.call("PATCH", fmt.Sprintf("repos/%s/releases/%d", target, dst.ID), jsonBody(map[string]string{"make_latest": "true"}), nil); err != nil {
 			return fmt.Errorf("set Latest: %w", err)
 		}
 	}
@@ -317,7 +319,8 @@ func (r *replicator) syncAssets(target string, src, dst release) error {
 	}
 
 	for _, a := range src.Assets {
-		if d, ok := existing[a.Name]; ok && sameAsset(a, d) {
+		d, exists := existing[a.Name]
+		if exists && sameAsset(a, d) {
 			fmt.Fprintf(os.Stderr, "    Asset %s unchanged.\n", a.Name)
 			continue
 		}
@@ -326,42 +329,66 @@ func (r *replicator) syncAssets(target string, src, dst release) error {
 			continue
 		}
 		fmt.Fprintf(os.Stderr, "    Replicating asset %s...\n", a.Name)
+		if err := func() error {
+			tmp, err := os.CreateTemp("", "gh-replicate-asset-*")
+			if err != nil {
+				return fmt.Errorf("create temporary asset file: %w", err)
+			}
+			defer os.Remove(tmp.Name())
+			defer tmp.Close()
 
-		tmp, err := os.CreateTemp("", "gh-replicate-asset-*")
-		if err != nil {
-			return fmt.Errorf("create temporary asset file: %w", err)
-		}
-		name := tmp.Name()
-		defer os.Remove(name)
-
-		if err := r.downloadAsset(a.URL, tmp); err != nil {
-			tmp.Close()
-			return fmt.Errorf("download asset %s: %w", a.Name, err)
-		}
-		if err := verifyAsset(tmp, a); err != nil {
-			tmp.Close()
+			if err := r.downloadAsset(a.URL, tmp); err != nil {
+				return fmt.Errorf("download asset %s: %w", a.Name, err)
+			}
+			digest, err := verifyAsset(tmp, a)
+			if err != nil {
+				return err
+			}
+			if exists {
+				equal, err := r.sameContent(a, d, digest)
+				if err != nil {
+					return fmt.Errorf("compare asset %s: %w", a.Name, err)
+				}
+				if equal {
+					fmt.Fprintf(os.Stderr, "    Asset %s unchanged.\n", a.Name)
+					return nil
+				}
+			}
+			if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+				return fmt.Errorf("rewind asset %s: %w", a.Name, err)
+			}
+			if exists {
+				if err := r.call("DELETE", fmt.Sprintf("repos/%s/releases/assets/%d", target, d.ID), nil, nil); err != nil {
+					return fmt.Errorf("replace asset %s: %w", a.Name, err)
+				}
+			}
+			if err := r.uploadAsset(target, dst.ID, a.Name, tmp, digest); err != nil {
+				return fmt.Errorf("upload asset %s: %w", a.Name, err)
+			}
+			return nil
+		}(); err != nil {
 			return err
 		}
-		if _, err := tmp.Seek(0, io.SeekStart); err != nil {
-			tmp.Close()
-			return fmt.Errorf("rewind asset %s: %w", a.Name, err)
-		}
-		if d, ok := existing[a.Name]; ok {
-			if err := r.call("DELETE", fmt.Sprintf("repos/%s/releases/assets/%d", target, d.ID), nil, nil); err != nil {
-				tmp.Close()
-				return fmt.Errorf("replace asset %s: %w", a.Name, err)
-			}
-		}
-		if err := r.uploadAsset(target, dst.ID, a.Name, tmp); err != nil {
-			tmp.Close()
-			return fmt.Errorf("upload asset %s: %w", a.Name, err)
-		}
-		if err := tmp.Close(); err != nil {
-			return fmt.Errorf("close asset %s: %w", a.Name, err)
-		}
-		os.Remove(name)
 	}
 	return nil
+}
+
+// sameContent hashes the destination only when its digest cannot decide.
+func (r *replicator) sameContent(a, d asset, digest string) (bool, error) {
+	if strings.HasPrefix(d.Digest, "sha256:") {
+		return d.Digest == digest, nil
+	}
+	if d.Size != a.Size {
+		return false, nil
+	}
+	if d.URL == "" {
+		return false, errors.New("destination asset URL is missing")
+	}
+	hash := sha256.New()
+	if err := r.downloadAsset(d.URL, hash); err != nil {
+		return false, err
+	}
+	return fmt.Sprintf("sha256:%x", hash.Sum(nil)) == digest, nil
 }
 
 func (r *replicator) downloadAsset(path string, dst io.Writer) error {
@@ -383,7 +410,7 @@ func (r *replicator) downloadAsset(path string, dst io.Writer) error {
 	return err
 }
 
-func (r *replicator) uploadAsset(target string, releaseID int64, name string, src *os.File) error {
+func (r *replicator) uploadAsset(target string, releaseID int64, name string, src *os.File, digest string) error {
 	stat, err := src.Stat()
 	if err != nil {
 		return err
@@ -407,11 +434,27 @@ func (r *replicator) uploadAsset(target string, releaseID int64, name string, sr
 		return err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("asset request failed: HTTP %d", resp.StatusCode)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if err != nil {
+		return fmt.Errorf("read asset response: %w", err)
 	}
-	_, err = io.Copy(io.Discard, resp.Body)
-	return err
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if len(body) > 4096 {
+			body = body[:4096]
+		}
+		return fmt.Errorf("asset request failed: HTTP %d: %q", resp.StatusCode, body)
+	}
+	var uploaded asset
+	if err := json.Unmarshal(body, &uploaded); err != nil {
+		return fmt.Errorf("decode asset response: %w (body %q)", err, body)
+	}
+	if uploaded.Size != stat.Size() {
+		return fmt.Errorf("asset %s: uploaded size %d, expected %d", name, uploaded.Size, stat.Size())
+	}
+	if strings.HasPrefix(uploaded.Digest, "sha256:") && uploaded.Digest != digest {
+		return fmt.Errorf("asset %s: uploaded SHA-256 differs from source", name)
+	}
+	return nil
 }
 
 func sameAsset(a, b asset) bool {
@@ -470,25 +513,24 @@ func (r *replicator) command(dir, name string, args ...string) error {
 }
 
 // Validate downloaded bytes before deleting an existing destination asset.
-func verifyAsset(file *os.File, a asset) error {
+func verifyAsset(file *os.File, a asset) (string, error) {
 	info, err := file.Stat()
 	if err != nil {
-		return err
+		return "", err
 	}
 	if info.Size() != a.Size {
-		return fmt.Errorf("asset %s: downloaded size differs from source", a.Name)
+		return "", fmt.Errorf("asset %s: downloaded size differs from source", a.Name)
 	}
-	if strings.HasPrefix(a.Digest, "sha256:") {
-		if _, err := file.Seek(0, io.SeekStart); err != nil {
-			return err
-		}
-		hash := sha256.New()
-		if _, err := io.Copy(hash, file); err != nil {
-			return err
-		}
-		if fmt.Sprintf("sha256:%x", hash.Sum(nil)) != a.Digest {
-			return fmt.Errorf("asset %s: downloaded SHA-256 differs from source", a.Name)
-		}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return "", err
 	}
-	return nil
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", err
+	}
+	digest := fmt.Sprintf("sha256:%x", hash.Sum(nil))
+	if strings.HasPrefix(a.Digest, "sha256:") && digest != a.Digest {
+		return "", fmt.Errorf("asset %s: downloaded SHA-256 differs from source", a.Name)
+	}
+	return digest, nil
 }
