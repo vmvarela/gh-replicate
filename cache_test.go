@@ -157,3 +157,157 @@ func TestLFSHistoryAndObsoleteCache(t *testing.T) {
 		t.Fatal("obsolete objects blocked clean source", err)
 	}
 }
+
+func TestCacheLockActiveChild(t *testing.T) {
+	if root := os.Getenv("GH_REPLICATE_ACTIVE_CHILD"); root != "" {
+		if os.Args[len(os.Args)-1] == "cache-child" {
+			if err := os.WriteFile(filepath.Join(root, "started"), nil, 0600); err != nil {
+				t.Fatal(err)
+			}
+			deadline := time.Now().Add(15 * time.Second)
+			for {
+				if _, err := os.Stat(filepath.Join(root, "finish")); err == nil {
+					return
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("child release timed out")
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		}
+		lock, err := lockCache(filepath.Join(root, "lock"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer lock.Close()
+		r := &replicator{cacheLock: lock, ctx: context.Background(), timeout: 20 * time.Second}
+		// A real Git process must retain the lock while its command is active.
+		alias := `!"` + filepath.ToSlash(os.Args[0]) + `" -test.run=^TestCacheLockActiveChild$ cache-child`
+		if err := r.command(root, side{}, "git", "-c", "alias.cache-child="+alias, "cache-child"); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	root := t.TempDir()
+	owner := exec.Command(os.Args[0], "-test.run=^TestCacheLockActiveChild$")
+	owner.Env = append(os.Environ(), "GH_REPLICATE_ACTIVE_CHILD="+root)
+	if err := owner.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = os.WriteFile(filepath.Join(root, "finish"), nil, 0600)
+		_ = owner.Process.Kill()
+		_ = owner.Wait()
+	}()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, err := os.Stat(filepath.Join(root, "started")); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("child never started")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := owner.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = owner.Wait()
+	if f, err := lockCache(filepath.Join(root, "lock")); err == nil {
+		f.Close()
+		t.Fatal("lock released while child is still active")
+	}
+	if err := os.WriteFile(filepath.Join(root, "finish"), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	deadline = time.Now().Add(10 * time.Second)
+	for {
+		if f, err := lockCache(filepath.Join(root, "lock")); err == nil {
+			f.Close()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("lock not released after child exit")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestSyncGitNewObjectsAndSecondTarget(t *testing.T) {
+	f := newGitFixture(t)
+	seamStub(t)
+	second := filepath.Join(t.TempDir(), "second.git")
+	gitTest(t, filepath.Dir(second), "init", "--bare", second)
+	gitRemote = func(repo string) string {
+		switch repo {
+		case sourceRepo:
+			return f.source
+		case targetRepo:
+			return f.destination
+		default:
+			return second
+		}
+	}
+	s := fakeSide(t, fakeServer(t, func(w http.ResponseWriter, req *http.Request) { fmt.Fprint(w, `{"enabled":false}`) }), "token")
+	r := &replicator{source: s, target: s, ctx: context.Background(), timeout: time.Minute}
+	if err := r.syncGit(sourceRepo, targetRepo); err != nil {
+		t.Fatal(err)
+	}
+	work := filepath.Join(t.TempDir(), "work")
+	gitTest(t, filepath.Dir(work), "clone", f.source, work)
+	gitTest(t, work, "config", "user.name", "Test")
+	gitTest(t, work, "config", "user.email", "test@example.com")
+	if err := os.WriteFile(filepath.Join(work, "new.txt"), []byte("new objects"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	gitTest(t, work, "add", "new.txt")
+	gitTest(t, work, "commit", "-m", "new content")
+	gitTest(t, work, "tag", "-f", "v1")
+	gitTest(t, work, "push", "--force", "origin", "main", "refs/tags/v1")
+	want := gitTest(t, work, "rev-parse", "HEAD")
+	for _, target := range []string{targetRepo, "bob/second"} {
+		if err := r.syncGit(sourceRepo, target); err != nil {
+			t.Fatal(err)
+		}
+		for _, ref := range []string{"main", "refs/tags/v1"} {
+			if got := gitTest(t, gitRemote(target), "rev-parse", ref); got != want {
+				t.Fatalf("%s %s: %s != %s", target, ref, got, want)
+			}
+		}
+		if got := gitTest(t, gitRemote(target), "show", "main:new.txt"); got != "new objects" {
+			t.Fatal(got)
+		}
+	}
+	root, err := os.UserCacheDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	caches, err := filepath.Glob(filepath.Join(root, "gh-replicate", "git-v1", "*.git"))
+	if err != nil || len(caches) != 1 {
+		t.Fatalf("expected shared source cache: %v %v", caches, err)
+	}
+}
+
+func TestLFSStreamingLargeListing(t *testing.T) {
+	dir := t.TempDir()
+	gitTest(t, dir, "init", "-b", "main")
+	gitTest(t, dir, "config", "user.name", "Test")
+	gitTest(t, dir, "config", "user.email", "test@example.com")
+	for i := 0; i < 2000; i++ {
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("file-%d", i)), []byte(fmt.Sprintf("content %d", i)), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gitTest(t, dir, "add", ".")
+	gitTest(t, dir, "commit", "-m", "more than a pipe buffer of objects")
+	r := &replicator{ctx: context.Background(), timeout: time.Minute}
+	if err := r.checkLFS(dir); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r.ctx = ctx
+	if err := r.checkLFS(dir); err == nil {
+		t.Fatal("cancelled scan succeeded")
+	}
+}

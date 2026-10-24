@@ -65,11 +65,12 @@ type side struct {
 }
 
 type replicator struct {
-	source  side
-	target  side
-	ctx     context.Context
-	timeout time.Duration
-	dryRun  bool
+	cacheLock *os.File
+	source    side
+	target    side
+	ctx       context.Context
+	timeout   time.Duration
+	dryRun    bool
 }
 
 type plan struct {
@@ -339,6 +340,9 @@ func (r *replicator) syncGit(source, target string) error {
 		return err
 	}
 	defer lock.Close()
+	locked := *r
+	locked.cacheLock = lock
+	r = &locked
 
 	if err := os.MkdirAll(gitDir, 0700); err != nil {
 		return fmt.Errorf("create source cache: %w", err)
@@ -637,7 +641,7 @@ func (r *replicator) command(dir string, s side, name string, args ...string) er
 	ctx, cancel := context.WithTimeout(r.ctx, r.timeout)
 	defer cancel()
 
-	cmd := gitCommand(ctx, s.token, name, args...)
+	cmd := r.gitCommand(ctx, s.token, name, args...)
 	cmd.Dir = dir
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

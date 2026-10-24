@@ -93,73 +93,74 @@ var tokenForAccount = func(login string) (string, error) {
 func (r *replicator) checkLFS(dir string) error {
 	ctx, cancel := context.WithTimeout(r.ctx, r.timeout)
 	defer cancel()
-	reachable := gitCommand(ctx, "", "git", "rev-list", "--objects", "--no-object-names", "--branches", "--tags")
-	reachable.Dir = dir
-	objectIDs, err := reachable.Output()
-	if err != nil {
-		return fmt.Errorf("enumerate reachable Git objects for LFS: %w", err)
+	reachable := r.gitCommand(ctx, "", "git", "rev-list", "--objects", "--no-object-names", "--branches", "--tags")
+	check := r.gitCommand(ctx, "", "git", "cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)")
+	read := r.gitCommand(ctx, "", "git", "cat-file", "--batch")
+	for _, cmd := range []*exec.Cmd{reachable, check, read} {
+		cmd.Dir = dir
 	}
-	check := gitCommand(ctx, "", "git", "cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)")
-	check.Stdin = bytes.NewReader(objectIDs)
-	check.Dir = dir
-	objects, err := check.Output()
+	objectIDs, err := reachable.StdoutPipe()
 	if err != nil {
-		return fmt.Errorf("inspect Git objects for LFS: %w", err)
+		return err
 	}
-	var ids bytes.Buffer
-	scanner := bufio.NewScanner(bytes.NewReader(objects))
+	defer objectIDs.Close()
+	check.Stdin = objectIDs
+	metadata, err := check.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	defer metadata.Close()
+	requests, err := read.StdinPipe()
+	if err != nil {
+		return err
+	}
+	defer requests.Close()
+	contents, err := read.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	defer contents.Close()
+	// Cancel and reap every started child on early detection, errors or timeout.
+	var started []*exec.Cmd
+	defer func() {
+		cancel()
+		for _, cmd := range started {
+			if cmd.ProcessState == nil {
+				_ = cmd.Process.Kill()
+				_ = cmd.Wait()
+			}
+		}
+	}()
+	for _, cmd := range []*exec.Cmd{read, check, reachable} {
+		if err := cmd.Start(); err != nil {
+			return fmt.Errorf("start LFS scan: %w", err)
+		}
+		started = append(started, cmd)
+	}
+	reader := bufio.NewReader(contents)
+	scanner := bufio.NewScanner(metadata)
 	for scanner.Scan() {
 		fields := strings.Fields(scanner.Text())
 		if len(fields) != 3 {
 			return errors.New("invalid git cat-file output")
 		}
-		size, err := strconv.ParseInt(fields[2], 10, 64)
-		if err != nil {
-			return err
-		}
-		if fields[1] == "blob" && size > 0 && size <= 1024 {
-			fmt.Fprintln(&ids, fields[0])
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		return err
-	}
-	if ids.Len() == 0 {
-		return nil
-	}
-	read := gitCommand(ctx, "", "git", "cat-file", "--batch")
-	read.Dir = dir
-	read.Stdin = &ids
-	stdout, err := read.StdoutPipe()
-	if err != nil {
-		return err
-	}
-	if err := read.Start(); err != nil {
-		return err
-	}
-	// On a detected pointer or malformed output, stop and reap the child.
-	defer func() {
-		if read.ProcessState == nil {
-			_ = read.Process.Kill()
-			_ = read.Wait()
-		}
-	}()
-	reader := bufio.NewReader(stdout)
-	for {
-		line, err := reader.ReadString('\n')
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return err
-		}
-		fields := strings.Fields(line)
-		if len(fields) != 3 {
-			return errors.New("invalid git cat-file object header")
-		}
 		size, err := strconv.Atoi(fields[2])
-		if err != nil || size < 0 || size > 1024 {
+		if err != nil || size < 0 {
 			return errors.New("invalid Git object size")
+		}
+		if fields[1] != "blob" || size == 0 || size > 1024 {
+			continue
+		}
+		if _, err := fmt.Fprintln(requests, fields[0]); err != nil {
+			return err
+		}
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return err
+		}
+		header := strings.Fields(line)
+		if len(header) != 3 || header[0] != fields[0] || header[1] != "blob" || header[2] != fields[2] {
+			return errors.New("invalid git cat-file object header")
 		}
 		data := make([]byte, size+1)
 		if _, err := io.ReadFull(reader, data); err != nil {
@@ -169,7 +170,18 @@ func (r *replicator) checkLFS(dir string) error {
 			return errors.New("Git LFS pointers detected; LFS objects are not supported, so replication stopped before destination changes")
 		}
 	}
-	return read.Wait()
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+	if err := requests.Close(); err != nil {
+		return err
+	}
+	for _, cmd := range []*exec.Cmd{reachable, check, read} {
+		if err := cmd.Wait(); err != nil {
+			return fmt.Errorf("scan Git objects for LFS: %w", err)
+		}
+	}
+	return nil
 }
 
 // Only reads are replayed. Retrying a POST after an ambiguous failure could
