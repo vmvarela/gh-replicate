@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -167,24 +168,47 @@ func TestPreflightAbortsBeforeWritesOnWrongAccount(t *testing.T) {
 	}
 }
 
-func TestPreflightWarnsAboutDestinationActions(t *testing.T) {
+func TestDisableDestinationActions(t *testing.T) {
 	for _, tc := range []struct {
-		name   string
-		status int
-		body   string
-		want   string
+		name    string
+		read    int
+		body    string
+		put     int
+		want    string
+		wantPut bool
 	}{
-		{"enabled", http.StatusOK, `{"enabled":true}`, "GitHub Actions are enabled"},
-		{"disabled", http.StatusOK, `{"enabled":false}`, ""},
-		{"unreadable", http.StatusForbidden, `{"message":"Resource not accessible"}`, "could not check"},
+		{"enabled", http.StatusOK, `{"enabled":true}`, http.StatusOK, "Disabled GitHub Actions", true},
+		{"disabled", http.StatusOK, `{"enabled":false}`, http.StatusOK, "", false},
+		{"unreadable", http.StatusForbidden, `{"message":"Resource not accessible"}`, http.StatusOK, "could not check", false},
+		{"rejected", http.StatusOK, `{"enabled":true}`, http.StatusForbidden, "could not be disabled", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			var puts int
 			server := fakeServer(t, func(w http.ResponseWriter, req *http.Request) {
 				switch {
 				case req.URL.Path == "/user":
 					fmt.Fprint(w, `{"login":"alice"}`)
 				case strings.HasSuffix(req.URL.Path, "/actions/permissions"):
-					w.WriteHeader(tc.status)
+					if req.Method == http.MethodPut {
+						puts++
+						if tc.put != http.StatusOK {
+							w.WriteHeader(tc.put)
+							fmt.Fprint(w, `{"message":"Resource not accessible"}`)
+							return
+						}
+						var body struct {
+							Enabled bool `json:"enabled"`
+						}
+						if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+							t.Error(err)
+						}
+						if body.Enabled {
+							t.Errorf("PUT kept Actions enabled")
+						}
+						fmt.Fprint(w, `{}`)
+						return
+					}
+					w.WriteHeader(tc.read)
 					fmt.Fprint(w, tc.body)
 				case strings.HasSuffix(req.URL.Path, "/topics"):
 					fmt.Fprint(w, `{"names":[]}`)
@@ -201,14 +225,13 @@ func TestPreflightWarnsAboutDestinationActions(t *testing.T) {
 			side := fakeSide(t, server, "token")
 			r := &replicator{source: side, target: side, ctx: context.Background(), timeout: time.Minute}
 
-			out := captureStderr(t, func() {
-				if _, err := r.preflight("alice/project", "bob/project-replica"); err != nil {
-					t.Fatal(err)
-				}
-			})
+			out := captureStderr(t, func() { r.disableActions("bob/project-replica") })
+			if got := puts > 0; got != tc.wantPut {
+				t.Fatalf("sent update: %v, want %v (output %q)", got, tc.wantPut, out)
+			}
 			if tc.want == "" {
-				if strings.Contains(out, "Warning") {
-					t.Fatalf("unexpected warning: %q", out)
+				if strings.Contains(out, "Warning") || strings.Contains(out, "Disabled GitHub Actions") {
+					t.Fatalf("unexpected output: %q", out)
 				}
 				return
 			}

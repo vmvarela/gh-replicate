@@ -230,18 +230,26 @@ func (r *replicator) verifyIdentities() error {
 	return nil
 }
 
-// warnIfActionsRun reports that a push can start destination workflows. The
-// check is advisory: an unreadable setting is reported, never fatal.
-func (r *replicator) warnIfActionsRun(target string) {
+// disableActions stops the destination from starting workflows when the push
+// lands. The push itself cannot be suppressed, so a failure here is reported and
+// never prevents the replication.
+func (r *replicator) disableActions(target string) {
 	var permissions struct {
 		Enabled bool `json:"enabled"`
 	}
 	if err := r.call(r.target, "GET", "repos/"+target+"/actions/permissions", nil, &permissions); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: could not check whether GitHub Actions are enabled in %s: %v\n", target, err)
+		fmt.Fprintf(os.Stderr, "Warning: could not check whether GitHub Actions are enabled in %s (%v), so this push may start its workflows. Check them in Settings > Actions > General > Actions permissions.\n", target, err)
 		return
 	}
-	if permissions.Enabled {
-		fmt.Fprintf(os.Stderr, "Warning: GitHub Actions are enabled in %s, so this replication can start its workflows. For a passive mirror, disable them once: Settings > Actions > General > Actions permissions > Disable actions > Save.\n", target)
+	if !permissions.Enabled {
+		return
+	}
+	if err := r.call(r.target, "PUT", "repos/"+target+"/actions/permissions", jsonBody(map[string]bool{"enabled": false}), nil); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: GitHub Actions are enabled in %s and could not be disabled (%v), so this replication can start its workflows. Disable them manually: Settings > Actions > General > Actions permissions > Disable actions > Save.\n", target, err)
+		return
+	}
+	if !r.dryRun {
+		fmt.Fprintf(os.Stderr, "Disabled GitHub Actions in %s for a passive mirror.\n", target)
 	}
 }
 
@@ -249,7 +257,6 @@ func (r *replicator) preflight(source, target string) (*plan, error) {
 	if err := r.verifyIdentities(); err != nil {
 		return nil, err
 	}
-	r.warnIfActionsRun(target)
 	p := &plan{}
 	if err := r.call(r.source, "GET", "repos/"+source, nil, &p.repository); err != nil {
 		return nil, err
@@ -333,6 +340,7 @@ func (r *replicator) syncGit(source, target string) error {
 	if err := r.checkLFS(gitDir); err != nil {
 		return err
 	}
+	r.disableActions(target)
 	fmt.Fprintf(os.Stderr, "  Pushing branches and tags to %s...\n", target)
 	return r.pushRefs(gitDir)
 }

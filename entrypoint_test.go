@@ -72,9 +72,9 @@ func gitRefs(t *testing.T, dir string) string {
 // fakeGitHubAPI serves the endpoints preflight reads. When writable, the
 // metadata writes of a real run are accepted and label PATCH returns 404 so
 // syncMetadata takes the POST path.
-func fakeGitHubAPI(t *testing.T, labelSet []label, writable bool, defaultBranch string) (string, *[]string, *string) {
+func fakeGitHubAPI(t *testing.T, labelSet []label, writable bool, defaultBranch string, actionsEnabled bool) (string, *[]string, *string, *[]string) {
 	t.Helper()
-	var methods []string
+	var methods, actionBodies []string
 	var metadataPatch string
 	server := fakeServer(t, func(w http.ResponseWriter, req *http.Request) {
 		methods = append(methods, req.Method+" "+req.URL.Path)
@@ -91,6 +91,13 @@ func fakeGitHubAPI(t *testing.T, labelSet []label, writable bool, defaultBranch 
 				w.WriteHeader(http.StatusForbidden)
 				return
 			}
+			if req.Method == http.MethodPut && strings.HasSuffix(req.URL.Path, "/actions/permissions") {
+				body, err := io.ReadAll(req.Body)
+				if err != nil {
+					t.Error(err)
+				}
+				actionBodies = append(actionBodies, string(body))
+			}
 			if req.Method == http.MethodPatch && strings.HasSuffix(req.URL.Path, "/labels/bug") {
 				w.WriteHeader(http.StatusNotFound)
 				fmt.Fprint(w, `{"message":"Not Found"}`)
@@ -103,7 +110,7 @@ func fakeGitHubAPI(t *testing.T, labelSet []label, writable bool, defaultBranch 
 		case req.URL.Path == "/user":
 			fmt.Fprint(w, `{"login":"user"}`)
 		case strings.HasSuffix(req.URL.Path, "/actions/permissions"):
-			fmt.Fprint(w, `{"enabled":false}`)
+			fmt.Fprintf(w, `{"enabled":%t}`, actionsEnabled)
 		case strings.HasSuffix(req.URL.Path, "/topics"):
 			fmt.Fprint(w, `{"names":[]}`)
 		case strings.HasSuffix(req.URL.Path, "/labels"):
@@ -123,7 +130,7 @@ func fakeGitHubAPI(t *testing.T, labelSet []label, writable bool, defaultBranch 
 			t.Errorf("unexpected request: %s %s", req.Method, req.URL.Path)
 		}
 	})
-	return server, &methods, &metadataPatch
+	return server, &methods, &metadataPatch, &actionBodies
 }
 
 // stubRun wires newSide and gitRemote to the fake servers and local bare repos.
@@ -201,7 +208,7 @@ func TestRunLeavesDestinationUntouchedWhenPreflightFails(t *testing.T) {
 		case req.URL.Path == "/user":
 			fmt.Fprint(w, `{"login":"bob"}`)
 		case strings.HasSuffix(req.URL.Path, "/actions/permissions"):
-			fmt.Fprint(w, `{"enabled":false}`)
+			fmt.Fprint(w, `{"enabled":true}`)
 		default:
 			fmt.Fprint(w, `{"description":"","homepage":""}`)
 		}
@@ -236,8 +243,8 @@ func TestRunDryRunLeavesDestinationUntouched(t *testing.T) {
 	before := gitRefs(t, f.destination)
 
 	labels := []label{{Name: "bug", Color: "d73a4a", Description: "Something isn't working"}}
-	sourceURL, _, _ := fakeGitHubAPI(t, labels, false, "main")
-	targetURL, targetMethods, _ := fakeGitHubAPI(t, nil, false, "main")
+	sourceURL, _, _, _ := fakeGitHubAPI(t, labels, false, "main", true)
+	targetURL, targetMethods, _, actionBodies := fakeGitHubAPI(t, nil, false, "main", true)
 	stubRun(t, sourceURL, targetURL, f)
 
 	out := captureStderr(t, func() {
@@ -247,6 +254,12 @@ func TestRunDryRunLeavesDestinationUntouched(t *testing.T) {
 	})
 	if !strings.Contains(out, "Dry run complete") {
 		t.Fatalf("missing dry-run confirmation: %q", out)
+	}
+	if !strings.Contains(out, "Would PUT repos/"+targetRepo+"/actions/permissions") {
+		t.Fatalf("dry run did not report the Actions update: %q", out)
+	}
+	if len(*actionBodies) != 0 {
+		t.Fatalf("dry run wrote Actions settings: %q", *actionBodies)
 	}
 	if after := gitRefs(t, f.destination); after != before {
 		t.Fatalf("destination refs changed:\nbefore %q\nafter  %q", before, after)
@@ -263,8 +276,8 @@ func TestRunReplicatesIntoDestination(t *testing.T) {
 	f := newGitFixture(t)
 
 	labels := []label{{Name: "bug", Color: "d73a4a", Description: "Something isn't working"}}
-	sourceURL, _, _ := fakeGitHubAPI(t, labels, false, "master")
-	targetURL, targetMethods, targetPatch := fakeGitHubAPI(t, nil, true, "main")
+	sourceURL, _, _, _ := fakeGitHubAPI(t, labels, false, "master", true)
+	targetURL, targetMethods, targetPatch, actionBodies := fakeGitHubAPI(t, nil, true, "main", true)
 	stubRun(t, sourceURL, targetURL, f)
 
 	out := captureStderr(t, func() {
@@ -277,6 +290,16 @@ func TestRunReplicatesIntoDestination(t *testing.T) {
 	}
 	if got, want := gitRefs(t, f.destination), gitRefs(t, f.source); got != want {
 		t.Fatalf("destination refs differ:\n got %q\nwant %q", got, want)
+	}
+	if len(*actionBodies) != 1 {
+		t.Fatalf("Actions PUT bodies = %q, want one", *actionBodies)
+	}
+	var actionsPayload map[string]any
+	if err := json.Unmarshal([]byte((*actionBodies)[0]), &actionsPayload); err != nil {
+		t.Fatal(err)
+	}
+	if enabled, ok := actionsPayload["enabled"]; !ok || enabled != false {
+		t.Fatalf("Actions payload = %s, want {\"enabled\":false}", (*actionBodies)[0])
 	}
 	issued := strings.Join(*targetMethods, "\n")
 	for _, want := range []string{
@@ -314,7 +337,10 @@ func TestSyncGitPropagatesRejectedPush(t *testing.T) {
 		t.Fatalf("unexpected repository %q", ownerRepo)
 		return ""
 	}
-	r := &replicator{ctx: context.Background(), timeout: time.Minute}
+	side := fakeSide(t, fakeServer(t, func(w http.ResponseWriter, req *http.Request) {
+		fmt.Fprint(w, `{"enabled":false}`)
+	}), "token")
+	r := &replicator{source: side, target: side, ctx: context.Background(), timeout: time.Minute}
 
 	err := r.syncGit(sourceRepo, targetRepo)
 	if err == nil || !strings.Contains(err.Error(), "push refs") {
@@ -338,7 +364,10 @@ func TestSyncGitClonesAndPushesRefs(t *testing.T) {
 		t.Fatalf("unexpected repository %q", ownerRepo)
 		return ""
 	}
-	r := &replicator{ctx: context.Background(), timeout: time.Minute}
+	side := fakeSide(t, fakeServer(t, func(w http.ResponseWriter, req *http.Request) {
+		fmt.Fprint(w, `{"enabled":false}`)
+	}), "token")
+	r := &replicator{source: side, target: side, ctx: context.Background(), timeout: time.Minute}
 
 	if err := r.syncGit(sourceRepo, targetRepo); err != nil {
 		t.Fatal(err)
