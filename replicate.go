@@ -238,7 +238,7 @@ func (r *replicator) disableActions(target string) {
 		Enabled bool `json:"enabled"`
 	}
 	if err := r.call(r.target, "GET", "repos/"+target+"/actions/permissions", nil, &permissions); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: could not check whether GitHub Actions are enabled in %s: %v\n", target, err)
+		fmt.Fprintf(os.Stderr, "Warning: could not check whether GitHub Actions are enabled in %s (%v), so this push may start its workflows. Check them in Settings > Actions > General > Actions permissions.\n", target, err)
 		return
 	}
 	if !permissions.Enabled {
@@ -257,7 +257,6 @@ func (r *replicator) preflight(source, target string) (*plan, error) {
 	if err := r.verifyIdentities(); err != nil {
 		return nil, err
 	}
-	r.disableActions(target)
 	p := &plan{}
 	if err := r.call(r.source, "GET", "repos/"+source, nil, &p.repository); err != nil {
 		return nil, err
@@ -341,6 +340,7 @@ func (r *replicator) syncGit(source, target string) error {
 	if err := r.checkLFS(gitDir); err != nil {
 		return err
 	}
+	r.disableActions(target)
 	fmt.Fprintf(os.Stderr, "  Pushing branches and tags to %s...\n", target)
 	return r.pushRefs(gitDir)
 }

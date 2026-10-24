@@ -168,7 +168,7 @@ func TestPreflightAbortsBeforeWritesOnWrongAccount(t *testing.T) {
 	}
 }
 
-func TestPreflightDisablesDestinationActions(t *testing.T) {
+func TestDisableDestinationActions(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		read    int
@@ -225,11 +225,7 @@ func TestPreflightDisablesDestinationActions(t *testing.T) {
 			side := fakeSide(t, server, "token")
 			r := &replicator{source: side, target: side, ctx: context.Background(), timeout: time.Minute}
 
-			out := captureStderr(t, func() {
-				if _, err := r.preflight("alice/project", "bob/project-replica"); err != nil {
-					t.Fatal(err)
-				}
-			})
+			out := captureStderr(t, func() { r.disableActions("bob/project-replica") })
 			if got := puts > 0; got != tc.wantPut {
 				t.Fatalf("sent update: %v, want %v (output %q)", got, tc.wantPut, out)
 			}
