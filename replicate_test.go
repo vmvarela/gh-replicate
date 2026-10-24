@@ -31,14 +31,14 @@ func (f transportFunc) RoundTrip(r *http.Request) (*http.Response, error) { retu
 func TestAssetHTTP(t *testing.T) {
 	r := &replicator{ctx: context.Background()}
 	for _, status := range []int{200, 401, 404, 500} {
-		r.httpClient = &http.Client{Transport: transportFunc(func(r *http.Request) (*http.Response, error) {
+		r.source.httpClient = &http.Client{Transport: transportFunc(func(r *http.Request) (*http.Response, error) {
 			if r.Header.Get("Accept") != "application/octet-stream" {
 				t.Error("missing binary accept header")
 			}
 			return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader("binary")), Header: make(http.Header)}, nil
 		})}
 		var dst bytes.Buffer
-		err := r.downloadAsset("https://api.github.com/repos/a/b/releases/assets/1", &dst)
+		err := r.downloadAsset(r.source, "https://api.github.com/repos/a/b/releases/assets/1", &dst)
 		if (err == nil) != (status == 200) {
 			t.Errorf("status %d: %v", status, err)
 		}
@@ -61,7 +61,7 @@ func TestUploadAsset(t *testing.T) {
 		if _, err = f.Seek(0, 0); err != nil {
 			t.Fatal(err)
 		}
-		r.httpClient = &http.Client{Transport: transportFunc(func(r *http.Request) (*http.Response, error) {
+		r.target.httpClient = &http.Client{Transport: transportFunc(func(r *http.Request) (*http.Response, error) {
 			if r.URL.Host != "uploads.github.com" || r.URL.Path != "/repos/a/b/releases/123/assets" || r.URL.Query().Get("name") != "file +.zip" {
 				t.Errorf("wrong upload URL: %s", r.URL)
 			}
@@ -112,7 +112,7 @@ func TestUploadAssetValidation(t *testing.T) {
 				t.Fatal(err)
 			}
 			r := &replicator{ctx: context.Background()}
-			r.httpClient = &http.Client{Transport: transportFunc(func(*http.Request) (*http.Response, error) {
+			r.target.httpClient = &http.Client{Transport: transportFunc(func(*http.Request) (*http.Response, error) {
 				return &http.Response{StatusCode: 201, Body: io.NopCloser(strings.NewReader(tc.body)), Header: make(http.Header)}, nil
 			})}
 			err = r.uploadAsset("a/b", 123, "file +.zip", f, assetDigest("binary"))
@@ -137,7 +137,7 @@ func TestUploadErrorBodyBounded(t *testing.T) {
 	}
 	body := strings.Repeat("x", 5000)
 	r := &replicator{ctx: context.Background()}
-	r.httpClient = &http.Client{Transport: transportFunc(func(*http.Request) (*http.Response, error) {
+	r.target.httpClient = &http.Client{Transport: transportFunc(func(*http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: 422, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
 	})}
 	err = r.uploadAsset("a/b", 123, "file +.zip", f, assetDigest("binary"))

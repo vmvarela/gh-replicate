@@ -49,13 +49,43 @@ func uniqueTags(releases []release) error {
 }
 
 // Configuration applies only to this child process. Never write ~/.gitconfig.
-func gitCommand(ctx context.Context, name string, args ...string) *exec.Cmd {
+func gitCommand(ctx context.Context, token, name string, args ...string) *exec.Cmd {
 	if name == "git" {
 		args = append([]string{"-c", "credential.helper=", "-c", "credential.https://github.com.helper=!gh auth git-credential", "-c", "http.https://github.com/.extraheader="}, args...)
 	}
 	cmd := exec.CommandContext(ctx, name, args...)
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	cmd.Env = gitEnv(token)
 	return cmd
+}
+
+// A side's token must replace the inherited one: duplicate entries are
+// resolved inconsistently by credential helpers.
+func gitEnv(token string) []string {
+	env := make([]string, 0, len(os.Environ())+2)
+	for _, entry := range os.Environ() {
+		if strings.HasPrefix(entry, "GH_TOKEN=") || strings.HasPrefix(entry, "GITHUB_TOKEN=") {
+			continue
+		}
+		env = append(env, entry)
+	}
+	if token != "" {
+		env = append(env, "GH_TOKEN="+token)
+	}
+	return append(env, "GIT_TERMINAL_PROMPT=0")
+}
+
+// tokenForAccount reads a token the user already stored for that account; it
+// never switches the active account or writes the credential store.
+var tokenForAccount = func(login string) (string, error) {
+	out, err := exec.Command("gh", "auth", "token", "--hostname", "github.com", "--user", login).Output()
+	if err != nil {
+		var exit *exec.ExitError
+		if errors.As(err, &exit) && len(bytes.TrimSpace(exit.Stderr)) > 0 {
+			return "", errors.New(strings.TrimSpace(string(exit.Stderr)))
+		}
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 // Detect LFS pointers in all objects of the bare clone, including historical
@@ -63,7 +93,7 @@ func gitCommand(ctx context.Context, name string, args ...string) *exec.Cmd {
 func (r *replicator) checkLFS(dir string) error {
 	ctx, cancel := context.WithTimeout(r.ctx, r.timeout)
 	defer cancel()
-	check := gitCommand(ctx, "git", "cat-file", "--batch-all-objects", "--batch-check=%(objectname) %(objecttype) %(objectsize)")
+	check := gitCommand(ctx, "", "git", "cat-file", "--batch-all-objects", "--batch-check=%(objectname) %(objecttype) %(objectsize)")
 	check.Dir = dir
 	objects, err := check.Output()
 	if err != nil {
@@ -90,7 +120,7 @@ func (r *replicator) checkLFS(dir string) error {
 	if ids.Len() == 0 {
 		return nil
 	}
-	read := gitCommand(ctx, "git", "cat-file", "--batch")
+	read := gitCommand(ctx, "", "git", "cat-file", "--batch")
 	read.Dir = dir
 	read.Stdin = &ids
 	stdout, err := read.StdoutPipe()
