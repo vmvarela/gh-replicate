@@ -166,3 +166,55 @@ func TestPreflightAbortsBeforeWritesOnWrongAccount(t *testing.T) {
 		t.Fatalf("requests after the mismatch: %v", paths)
 	}
 }
+
+func TestPreflightWarnsAboutDestinationActions(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+		want   string
+	}{
+		{"enabled", http.StatusOK, `{"enabled":true}`, "GitHub Actions are enabled"},
+		{"disabled", http.StatusOK, `{"enabled":false}`, ""},
+		{"unreadable", http.StatusForbidden, `{"message":"Resource not accessible"}`, "could not check"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := fakeServer(t, func(w http.ResponseWriter, req *http.Request) {
+				switch {
+				case req.URL.Path == "/user":
+					fmt.Fprint(w, `{"login":"alice"}`)
+				case strings.HasSuffix(req.URL.Path, "/actions/permissions"):
+					w.WriteHeader(tc.status)
+					fmt.Fprint(w, tc.body)
+				case strings.HasSuffix(req.URL.Path, "/topics"):
+					fmt.Fprint(w, `{"names":[]}`)
+				case strings.HasSuffix(req.URL.Path, "/labels"):
+					fmt.Fprint(w, `[]`)
+				case strings.HasSuffix(req.URL.Path, "/releases/latest"):
+					w.WriteHeader(http.StatusNotFound)
+				case strings.HasSuffix(req.URL.Path, "/releases"):
+					fmt.Fprint(w, `[]`)
+				default:
+					fmt.Fprint(w, `{"description":"","homepage":""}`)
+				}
+			})
+			side := fakeSide(t, server, "token")
+			r := &replicator{source: side, target: side, ctx: context.Background(), timeout: time.Minute}
+
+			out := captureStderr(t, func() {
+				if _, err := r.preflight("alice/project", "bob/project-replica"); err != nil {
+					t.Fatal(err)
+				}
+			})
+			if tc.want == "" {
+				if strings.Contains(out, "Warning") {
+					t.Fatalf("unexpected warning: %q", out)
+				}
+				return
+			}
+			if !strings.Contains(out, tc.want) {
+				t.Fatalf("missing %q in %q", tc.want, out)
+			}
+		})
+	}
+}

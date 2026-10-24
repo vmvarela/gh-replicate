@@ -224,10 +224,26 @@ func (r *replicator) verifyIdentities() error {
 	return nil
 }
 
+// warnIfActionsRun reports that a push can start destination workflows. The
+// check is advisory: an unreadable setting is reported, never fatal.
+func (r *replicator) warnIfActionsRun(target string) {
+	var permissions struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := r.call(r.target, "GET", "repos/"+target+"/actions/permissions", nil, &permissions); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not check whether GitHub Actions are enabled in %s: %v\n", target, err)
+		return
+	}
+	if permissions.Enabled {
+		fmt.Fprintf(os.Stderr, "Warning: GitHub Actions are enabled in %s, so this replication can start its workflows. For a passive mirror, disable them once: Settings > Actions > General > Actions permissions > Disable actions > Save.\n", target)
+	}
+}
+
 func (r *replicator) preflight(source, target string) (*plan, error) {
 	if err := r.verifyIdentities(); err != nil {
 		return nil, err
 	}
+	r.warnIfActionsRun(target)
 	p := &plan{}
 	if err := r.call(r.source, "GET", "repos/"+source, nil, &p.repository); err != nil {
 		return nil, err
