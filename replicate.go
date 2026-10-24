@@ -329,17 +329,34 @@ func (r *replicator) syncGit(source, target string) error {
 	}
 	defer os.RemoveAll(dir)
 
-	gitDir := filepath.Join(dir, "repo.git")
-	fmt.Fprintf(os.Stderr, "  Cloning %s...\n", source)
-	if err := r.command("", r.source, "git", "clone", "--bare", gitRemote(source), gitDir); err != nil {
-		return fmt.Errorf("clone source: %w", err)
+	if err := r.command("", r.target, "gh", "auth", "setup-git"); err != nil {
+		return fmt.Errorf("setup git authentication: %w", err)
 	}
-	if err := r.command(gitDir, r.source, "git", "remote", "add", "replicate-target", gitRemote(target)); err != nil {
-		return fmt.Errorf("add destination remote: %w", err)
+
+	gitDir := filepath.Join(dir, "repo.git")
+	fmt.Fprintf(os.Stderr, "  Cloning %s...\n", target)
+	if err := r.command("", r.target, "git", "clone", "--bare",
+		"--origin", "replicate-target", gitRemote(target), gitDir); err != nil {
+		return fmt.Errorf("clone target: %w", err)
+	}
+	if err := r.command(gitDir, r.source, "git", "remote", "add",
+		"replicate-source", gitRemote(source)); err != nil {
+		return fmt.Errorf("add source remote: %w", err)
+	}
+
+	fmt.Fprintf(os.Stderr, "  Fetching branches and tags from %s...\n", source)
+	// Reuse the target's objects, but keep only source refs locally.
+	// Pruning affects this temporary clone; the push never deletes target refs.
+	if err := r.command(gitDir, r.source, "git", "fetch", "--prune", "--no-tags",
+		"replicate-source",
+		"+refs/heads/*:refs/heads/*",
+		"+refs/tags/*:refs/tags/*"); err != nil {
+		return fmt.Errorf("fetch source: %w", err)
 	}
 	if err := r.checkLFS(gitDir); err != nil {
 		return err
 	}
+
 	r.disableActions(target)
 	fmt.Fprintf(os.Stderr, "  Pushing branches and tags to %s...\n", target)
 	return r.pushRefs(gitDir)
