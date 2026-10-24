@@ -3,12 +3,18 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"strings"
 	"testing"
 )
+
+func assetDigest(s string) string {
+	return fmt.Sprintf("sha256:%x", sha256.Sum256([]byte(s)))
+}
 
 func TestValidRepo(t *testing.T) {
 	for input, want := range map[string]bool{"owner/repo": true, "owner/": false, "/repo": false, "repo": false, "a/b/c": false, "a/b?x": false, "a/..": false} {
@@ -68,12 +74,75 @@ func TestUploadAsset(t *testing.T) {
 			if err := r.Body.Close(); err != nil {
 				t.Error(err)
 			}
-			return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader("{}")), Header: make(http.Header)}, nil
+			body := "{}"
+			if status == 201 {
+				body = fmt.Sprintf(`{"name":"file +.zip","size":6,"digest":%q}`, assetDigest("binary"))
+			}
+			return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
 		})}
-		err = r.uploadAsset("a/b", 123, "file +.zip", f)
+		err = r.uploadAsset("a/b", 123, "file +.zip", f, assetDigest("binary"))
 		if (err == nil) != (status == 201) {
 			t.Errorf("status %d: %v", status, err)
 		}
+	}
+}
+
+func TestUploadAssetValidation(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		body    string
+		wantErr bool
+	}{
+		{"missing digest", `{"size":6}`, false},
+		{"wrong size", `{"size":5,"digest":"` + assetDigest("binary") + `"}`, true},
+		{"wrong digest", `{"size":6,"digest":"sha256:bad"}`, true},
+		{"malformed JSON", `{`, true},
+		{"empty body", ``, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, err := os.CreateTemp(t.TempDir(), "asset")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer f.Close()
+			if _, err := f.WriteString("binary"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.Seek(0, io.SeekStart); err != nil {
+				t.Fatal(err)
+			}
+			r := &replicator{ctx: context.Background()}
+			r.httpClient = &http.Client{Transport: transportFunc(func(*http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: 201, Body: io.NopCloser(strings.NewReader(tc.body)), Header: make(http.Header)}, nil
+			})}
+			err = r.uploadAsset("a/b", 123, "file +.zip", f, assetDigest("binary"))
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("wantErr=%v, got %v", tc.wantErr, err)
+			}
+		})
+	}
+}
+
+func TestUploadErrorBodyBounded(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "asset")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := f.WriteString("binary"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	body := strings.Repeat("x", 5000)
+	r := &replicator{ctx: context.Background()}
+	r.httpClient = &http.Client{Transport: transportFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 422, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+	})}
+	err = r.uploadAsset("a/b", 123, "file +.zip", f, assetDigest("binary"))
+	if err == nil || !strings.Contains(err.Error(), strings.Repeat("x", 4096)) || strings.Contains(err.Error(), strings.Repeat("x", 4097)) {
+		t.Fatalf("error body was not bounded: %v", err)
 	}
 }
 func TestSameAsset(t *testing.T) {
