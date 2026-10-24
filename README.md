@@ -79,6 +79,8 @@ The destination repository must already exist. Matching source branches, tags, r
 
 Running the command again is safe: unchanged release assets are detected and skipped.
 
+A push can start the destination's GitHub Actions workflows, including one introduced by the same push. Before cloning, `gh replicate` checks whether Actions are enabled there and warns when they are, or when the setting cannot be read (that check needs administration read access). For a passive mirror, disable them once in the destination: **Settings > Actions > General > Actions permissions > Disable actions > Save**. The warning never stops the replication.
+
 ### Replicating between two accounts
 
 Each side can use a different account that is already authenticated on this machine:
