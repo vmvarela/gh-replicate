@@ -79,7 +79,7 @@ The destination repository must already exist. Matching source branches, tags, r
 
 Running the command again is safe: unchanged release assets are detected and skipped.
 
-A push can start the destination's GitHub Actions workflows, including one introduced by the same push. Before cloning, `gh replicate` checks whether Actions are enabled there and warns when they are, or when the setting cannot be read (that check needs administration read access). For a passive mirror, disable them once in the destination: **Settings > Actions > General > Actions permissions > Disable actions > Save**. The warning never stops the replication.
+A push can start the destination's GitHub Actions workflows, including one introduced by the same push. Before cloning, `gh replicate` disables Actions in the destination when they are enabled and reports it; that needs administration write access, the same permission that changing the default branch needs. If the setting cannot be read or the update is rejected, the run warns and continues, and the remaining option is manual: **Settings > Actions > General > Actions permissions > Disable actions > Save**. A dry run only reports the update it would send. Runs that already started are not cancelled.
 
 ### Replicating between two accounts
 
@@ -115,7 +115,7 @@ When both sides resolve to the same account it prints a single line. An account 
 - **Timeout and cancellation.** `--timeout 30m` sets the limit per Git command or HTTP request, not for the entire replication. Use a larger duration for large repositories/assets. Ctrl-C cancels pending work.
 - **Bounded read retries.** GET requests retry at most twice for selected transient HTTP failures and rate limits, respecting server delays up to 30 seconds. Longer rate limits fail rather than retry early. Mutating requests are never replayed automatically after uncertain failures; rerun the command to reconcile.
 - **Asset replacement is not atomic.** Source downloads are checked for size and SHA-256 before a matching destination asset is deleted. Unchanged assets are detected by digest; when a digest is missing, equal-sized destination content is downloaded and hashed, so repeated runs preserve asset IDs at the cost of an extra download. Upload responses are checked for size and digest. A failed upload can still leave that asset absent until a successful rerun.
-- Original release authors and publication dates are not preserved. Discussions, permissions and Actions settings are not replicated. Workflow files themselves are part of Git history and are copied with refs.
+- Original release authors and publication dates are not preserved. Discussions, permissions and Actions settings are not replicated, although Actions are disabled in the destination. Workflow files themselves are part of Git history and are copied with refs.
 
 ## Release binaries
 
