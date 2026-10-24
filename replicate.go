@@ -83,6 +83,9 @@ type plan struct {
 var repoPart = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
 var nextLink = regexp.MustCompile(`<([^>]+)>;\s*rel="next"`)
 
+// gitRemote is the URL the bare clone and its destination remote use.
+var gitRemote = func(ownerRepo string) string { return "https://github.com/" + ownerRepo + ".git" }
+
 func run(args []string) error {
 	flags := flag.NewFlagSet("gh replicate", flag.ContinueOnError)
 	dryRun := flags.Bool("dry-run", false, "inspect replication without changing the destination")
@@ -147,7 +150,9 @@ func run(args []string) error {
 
 // newSide resolves one side's credentials without touching the active account,
 // the global Git configuration or the credential store.
-func newSide(role, account string, timeout time.Duration) (side, error) {
+var newSide = newSideFromAccounts
+
+func newSideFromAccounts(role, account string, timeout time.Duration) (side, error) {
 	s := side{login: account}
 	if account != "" {
 		token, err := tokenForAccount(account)
@@ -318,10 +323,10 @@ func (r *replicator) syncGit(source, target string) error {
 
 	gitDir := filepath.Join(dir, "repo.git")
 	fmt.Fprintf(os.Stderr, "  Cloning %s...\n", source)
-	if err := r.command("", r.source, "git", "clone", "--bare", "https://github.com/"+source+".git", gitDir); err != nil {
+	if err := r.command("", r.source, "git", "clone", "--bare", gitRemote(source), gitDir); err != nil {
 		return fmt.Errorf("clone source: %w", err)
 	}
-	if err := r.command(gitDir, r.source, "git", "remote", "add", "replicate-target", "https://github.com/"+target+".git"); err != nil {
+	if err := r.command(gitDir, r.source, "git", "remote", "add", "replicate-target", gitRemote(target)); err != nil {
 		return fmt.Errorf("add destination remote: %w", err)
 	}
 	if err := r.checkLFS(gitDir); err != nil {
