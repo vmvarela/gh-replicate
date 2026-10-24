@@ -323,32 +323,44 @@ func validRepo(s string) bool {
 }
 
 func (r *replicator) syncGit(source, target string) error {
-	dir, err := os.MkdirTemp("", "gh-replicate-*")
+	cacheDir, err := os.UserCacheDir()
 	if err != nil {
-		return fmt.Errorf("create temporary directory: %w", err)
+		return fmt.Errorf("locate cache directory: %w", err)
 	}
-	defer os.RemoveAll(dir)
+	dir := filepath.Join(cacheDir, "gh-replicate", "git-v1")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return fmt.Errorf("create cache directory: %w", err)
+	}
+	// Share source objects across destinations without persisting credentials.
+	key := fmt.Sprintf("%x", sha256.Sum256([]byte(gitRemote(source))))
+	gitDir := filepath.Join(dir, key+".git")
+	lockDir := gitDir + ".lock"
+	if err := os.Mkdir(lockDir, 0700); err != nil {
+		if os.IsExist(err) {
+			return fmt.Errorf("source cache is locked: %s; retry later, or remove the lock only after confirming no replication is running", lockDir)
+		}
+		return fmt.Errorf("lock source cache: %w", err)
+	}
+	defer os.Remove(lockDir)
 
-	if err := r.command("", r.target, "gh", "auth", "setup-git"); err != nil {
-		return fmt.Errorf("setup git authentication: %w", err)
+	if err := os.MkdirAll(gitDir, 0700); err != nil {
+		return fmt.Errorf("create source cache: %w", err)
+	}
+	// init is idempotent, including after an interrupted first initialization.
+	if err := r.command("", r.source, "git", "init", "--bare", "--quiet", gitDir); err != nil {
+		return fmt.Errorf("initialize source cache: %w", err)
+	}
+	if err := r.command(gitDir, r.target, "git", "config", "--local",
+		"remote.replicate-target.url", gitRemote(target)); err != nil {
+		return fmt.Errorf("configure destination remote: %w", err)
 	}
 
-	gitDir := filepath.Join(dir, "repo.git")
-	fmt.Fprintf(os.Stderr, "  Cloning %s...\n", target)
-	if err := r.command("", r.target, "git", "clone", "--bare",
-		"--origin", "replicate-target", gitRemote(target), gitDir); err != nil {
-		return fmt.Errorf("clone target: %w", err)
-	}
-	if err := r.command(gitDir, r.source, "git", "remote", "add",
-		"replicate-source", gitRemote(source)); err != nil {
-		return fmt.Errorf("add source remote: %w", err)
-	}
-
-	fmt.Fprintf(os.Stderr, "  Fetching branches and tags from %s...\n", source)
-	// Reuse the target's objects, but keep only source refs locally.
-	// Pruning affects this temporary clone; the push never deletes target refs.
-	if err := r.command(gitDir, r.source, "git", "fetch", "--prune", "--no-tags",
-		"replicate-source",
+	fmt.Fprintf(os.Stderr, "  Fetching branches and tags from %s (cache: %s)...\n", source, gitDir)
+	// Prune stale source refs locally so deleted source refs are never pushed
+	// back. The destination push does not prune destination-only refs.
+	// Fetch must succeed on every run; never push a stale cache after failure.
+	if err := r.command(gitDir, r.source, "git", "fetch", "--atomic", "--prune", "--no-tags",
+		gitRemote(source),
 		"+refs/heads/*:refs/heads/*",
 		"+refs/tags/*:refs/tags/*"); err != nil {
 		return fmt.Errorf("fetch source: %w", err)
