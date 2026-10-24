@@ -4,6 +4,8 @@ import os
 import subprocess
 import sys
 
+GIT_AUTH = ["git", "-c", "credential.helper=", "-c", "credential.https://github.com.helper=!gh auth git-credential", "-c", "http.https://github.com/.extraheader="]
+
 source = os.environ["SOURCE_REPOSITORY"]
 target = os.environ["TARGET_REPOSITORY"]
 
@@ -29,6 +31,14 @@ def releases(repo):
 
 def ids(rs):
     return {tag: {a["name"]: a["id"] for a in r["assets"]} for tag, r in rs.items()}
+
+def latest(repo):
+    result = subprocess.run(["gh", "api", f"repos/{repo}/releases/latest"], capture_output=True, text=True)
+    if result.returncode:
+        if "HTTP 404" in result.stderr:
+            return None
+        raise RuntimeError(result.stderr)
+    return json.loads(result.stdout)["tag_name"]
 
 dst = releases(target)
 if sys.argv[1] == "snapshot":
@@ -62,9 +72,13 @@ for label in pages(f"repos/{source}/labels"):
         assert (label[key] or "") == (labels[label["name"]][key] or ""), f"Label {label['name']}: {key}: {label[key]!r} != {labels[label['name']][key]!r}"
 
 def refs(repo):
-    output = subprocess.check_output(["git", "ls-remote", "--heads", "--tags", f"https://github.com/{repo}.git"], text=True)
+    output = subprocess.check_output(GIT_AUTH + ["ls-remote", "--heads", "--tags", f"https://github.com/{repo}.git"], text=True)
     return {line.split()[1]: line.split()[0] for line in output.splitlines()}
 target_refs = refs(target)
 for name, sha in refs(source).items():
     assert target_refs.get(name) == sha, f"Ref mismatch: {name}"
-print(f"Verified {len(src)} releases, {count} asset digests, refs, metadata, topics, labels and stable asset IDs.")
+source_latest = latest(source)
+if source_latest is not None:
+    assert latest(target) == source_latest, "Latest release differs"
+print(f"Verified {len(src)} releases, {count} asset digests, refs, metadata, topics, labels, Latest and stable asset IDs.")
+
