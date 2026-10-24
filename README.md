@@ -79,7 +79,7 @@ The destination repository must already exist. Matching source branches, tags, r
 
 Running the command again is safe: unchanged release assets are detected and skipped.
 
-A push can start the destination's GitHub Actions workflows, including one introduced by the same push. Before cloning, `gh replicate` disables Actions in the destination when they are enabled and reports it; that needs administration write access, the same permission that changing the default branch needs. If the setting cannot be read or the update is rejected, the run warns and continues, and the remaining option is manual: **Settings > Actions > General > Actions permissions > Disable actions > Save**. A dry run only reports the update it would send. Runs that already started are not cancelled.
+A push can start the destination's GitHub Actions workflows, including one introduced by the same push. Once the source has been validated and the push is about to happen, `gh replicate` disables Actions in the destination when they are enabled and reports it; that needs administration write access, the same permission that changing the default branch needs. If the setting cannot be read or the update is rejected, the run warns and continues, and the remaining option is manual: **Settings > Actions > General > Actions permissions > Disable actions > Save**. A dry run only reports the update it would send. Runs that already started are not cancelled.
 
 ### Replicating between two accounts
 
