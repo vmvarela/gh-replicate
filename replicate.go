@@ -24,8 +24,9 @@ import (
 )
 
 type repository struct {
-	Description string `json:"description"`
-	Homepage    string `json:"homepage"`
+	Description   string `json:"description"`
+	Homepage      string `json:"homepage"`
+	DefaultBranch string `json:"default_branch"`
 }
 
 type label struct {

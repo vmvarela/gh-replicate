@@ -75,7 +75,7 @@ For example:
 gh replicate vmvarela/project vmvarela/project-replica
 ```
 
-The destination repository must already exist. Matching source branches, tags, releases, assets, metadata, topics, and labels are synchronized. Destination-only branches, tags, releases, assets, and labels are preserved.
+The destination repository must already exist. Matching source branches, tags, releases, assets, metadata, topics, and labels are synchronized, and the destination default branch is set to the source's. Destination-only branches, tags, releases, assets, and labels are preserved.
 
 Running the command again is safe: unchanged release assets are detected and skipped.
 

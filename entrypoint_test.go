@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -331,5 +332,31 @@ func TestSyncGitClonesAndPushesRefs(t *testing.T) {
 	}
 	if got, want := gitTest(t, f.destination, "rev-parse", "refs/tags/v1"), gitTest(t, f.source, "rev-parse", "refs/tags/v1"); got != want {
 		t.Fatalf("tag v1 = %s, want %s", got, want)
+	}
+}
+
+func TestSyncMetadataSetsDestinationDefaultBranch(t *testing.T) {
+	var patch string
+	server := fakeServer(t, func(w http.ResponseWriter, req *http.Request) {
+		if req.Method == http.MethodPatch {
+			body, err := io.ReadAll(req.Body)
+			if err != nil {
+				t.Error(err)
+			}
+			patch = string(body)
+		}
+		fmt.Fprint(w, `{}`)
+	})
+	r := &replicator{ctx: context.Background(), target: fakeSide(t, server, "test-token")}
+	p := &plan{repository: repository{Description: "d", DefaultBranch: "master"}}
+	if err := r.syncMetadata(targetRepo, p); err != nil {
+		t.Fatalf("sync metadata: %v", err)
+	}
+	var body map[string]string
+	if err := json.Unmarshal([]byte(patch), &body); err != nil {
+		t.Fatalf("decode patch %q: %v", patch, err)
+	}
+	if body["default_branch"] != "master" {
+		t.Fatalf("default_branch = %q, want master", body["default_branch"])
 	}
 }
