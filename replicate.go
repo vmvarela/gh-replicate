@@ -53,12 +53,22 @@ type asset struct {
 	URL    string `json:"url"`
 }
 
-type replicator struct {
+// side is one endpoint's credentials: an already-authenticated gh account or
+// the inherited one. login is set only when an account was requested.
+type side struct {
 	client     *api.RESTClient
 	httpClient *http.Client
-	ctx        context.Context
-	timeout    time.Duration
-	dryRun     bool
+	token      string
+	login      string
+	credential string
+}
+
+type replicator struct {
+	source  side
+	target  side
+	ctx     context.Context
+	timeout time.Duration
+	dryRun  bool
 }
 
 type plan struct {
@@ -77,6 +87,8 @@ func run(args []string) error {
 	flags := flag.NewFlagSet("gh replicate", flag.ContinueOnError)
 	dryRun := flags.Bool("dry-run", false, "inspect replication without changing the destination")
 	timeout := flags.Duration("timeout", 30*time.Minute, "timeout per Git command or HTTP request")
+	sourceAccount := flags.String("source-account", "", "authenticated gh account login used to read the source")
+	targetAccount := flags.String("target-account", "", "authenticated gh account login used to write the destination")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
@@ -84,7 +96,7 @@ func run(args []string) error {
 		return err
 	}
 	if flags.NArg() != 2 {
-		return errors.New("usage: gh replicate [--dry-run] [--timeout 30m] SOURCE TARGET")
+		return errors.New("usage: gh replicate [--dry-run] [--timeout 30m] [--source-account LOGIN] [--target-account LOGIN] SOURCE TARGET")
 	}
 	if *timeout <= 0 {
 		return errors.New("timeout must be positive")
@@ -102,16 +114,15 @@ func run(args []string) error {
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
-	opts := api.ClientOptions{Host: "github.com", Timeout: *timeout, Transport: retryTransport{base: http.DefaultTransport}}
-	client, err := api.NewRESTClient(opts)
+	src, err := newSide("source", *sourceAccount, *timeout)
 	if err != nil {
 		return err
 	}
-	httpClient, err := api.NewHTTPClient(opts)
+	dst, err := newSide("target", *targetAccount, *timeout)
 	if err != nil {
 		return err
 	}
-	r := &replicator{client: client, httpClient: httpClient, ctx: ctx, timeout: *timeout, dryRun: *dryRun}
+	r := &replicator{source: src, target: dst, ctx: ctx, timeout: *timeout, dryRun: *dryRun}
 	fmt.Fprintf(os.Stderr, "Source: %s -> Target: %s (matching refs will be overwritten)\n", source, target)
 	p, err := r.preflight(source, target)
 	if err != nil {
@@ -134,31 +145,104 @@ func run(args []string) error {
 	return nil
 }
 
+// newSide resolves one side's credentials without touching the active account,
+// the global Git configuration or the credential store.
+func newSide(role, account string, timeout time.Duration) (side, error) {
+	s := side{login: account}
+	if account != "" {
+		token, err := tokenForAccount(account)
+		if err != nil {
+			return side{}, fmt.Errorf("%s account %q: %w", role, account, err)
+		}
+		s.token = token
+		s.credential = "gh auth token --user " + account
+	} else {
+		s.token, s.credential = auth.TokenForHost("github.com")
+	}
+	opts := api.ClientOptions{Host: "github.com", AuthToken: s.token, Timeout: timeout, Transport: retryTransport{base: http.DefaultTransport}}
+	client, err := api.NewRESTClient(opts)
+	if err != nil {
+		return side{}, err
+	}
+	httpClient, err := api.NewHTTPClient(opts)
+	if err != nil {
+		return side{}, err
+	}
+	s.client, s.httpClient = client, httpClient
+	return s, nil
+}
+
 // call is the only JSON write path; dry runs never send mutating HTTP requests.
-func (r *replicator) call(method, path string, body io.Reader, out any) error {
+func (r *replicator) call(s side, method, path string, body io.Reader, out any) error {
 	if r.dryRun && method != http.MethodGet {
 		fmt.Fprintf(os.Stderr, "  Would %s %s\n", method, path)
 		return nil
 	}
-	return r.client.DoWithContext(r.ctx, method, path, body, out)
+	return s.client.DoWithContext(r.ctx, method, path, body, out)
+}
+
+// identify proves which account a side actually acts as. Without a requested
+// account the login is reported but not enforced, so the inherited path keeps
+// working with tokens that cannot read /user.
+func (r *replicator) identify(role string, s side) (string, error) {
+	var user struct {
+		Login string `json:"login"`
+	}
+	if err := r.call(s, "GET", "user", nil, &user); err != nil {
+		if s.login == "" {
+			fmt.Fprintf(os.Stderr, "  %s identity unavailable: %v\n", role, err)
+			return "", nil
+		}
+		return "", fmt.Errorf("%s identity for account %q: %w", role, s.login, err)
+	}
+	if s.login != "" && !strings.EqualFold(user.Login, s.login) {
+		return "", fmt.Errorf("%s token authenticates as %q, not the requested account %q; nothing was changed", role, user.Login, s.login)
+	}
+	return user.Login, nil
+}
+
+// verifyIdentities runs before the clone and before any write.
+func (r *replicator) verifyIdentities() error {
+	src, err := r.identify("source", r.source)
+	if err != nil {
+		return err
+	}
+	dst, err := r.identify("target", r.target)
+	if err != nil {
+		return err
+	}
+	if src != "" && src == dst {
+		fmt.Fprintf(os.Stderr, "Identity: %s (%s) for both sides\n", src, r.source.credential)
+		return nil
+	}
+	if src != "" {
+		fmt.Fprintf(os.Stderr, "Source identity: %s (%s)\n", src, r.source.credential)
+	}
+	if dst != "" {
+		fmt.Fprintf(os.Stderr, "Target identity: %s (%s)\n", dst, r.target.credential)
+	}
+	return nil
 }
 
 func (r *replicator) preflight(source, target string) (*plan, error) {
+	if err := r.verifyIdentities(); err != nil {
+		return nil, err
+	}
 	p := &plan{}
-	if err := r.call("GET", "repos/"+source, nil, &p.repository); err != nil {
+	if err := r.call(r.source, "GET", "repos/"+source, nil, &p.repository); err != nil {
 		return nil, err
 	}
 	var dst repository
-	if err := r.call("GET", "repos/"+target, nil, &dst); err != nil {
+	if err := r.call(r.target, "GET", "repos/"+target, nil, &dst); err != nil {
 		return nil, err
 	}
 	var srcTopics, dstTopics struct {
 		Names []string `json:"names"`
 	}
-	if err := r.call("GET", "repos/"+source+"/topics", nil, &srcTopics); err != nil {
+	if err := r.call(r.source, "GET", "repos/"+source+"/topics", nil, &srcTopics); err != nil {
 		return nil, err
 	}
-	if err := r.call("GET", "repos/"+target+"/topics", nil, &dstTopics); err != nil {
+	if err := r.call(r.target, "GET", "repos/"+target+"/topics", nil, &dstTopics); err != nil {
 		return nil, err
 	}
 	var err error
@@ -166,15 +250,15 @@ func (r *replicator) preflight(source, target string) (*plan, error) {
 	if err != nil {
 		return nil, err
 	}
-	p.labels, err = getAll[label](r, "repos/"+source+"/labels?per_page=100")
+	p.labels, err = getAll[label](r, r.source, "repos/"+source+"/labels?per_page=100")
 	if err != nil {
 		return nil, err
 	}
-	p.sourceReleases, err = getAll[release](r, "repos/"+source+"/releases?per_page=100")
+	p.sourceReleases, err = getAll[release](r, r.source, "repos/"+source+"/releases?per_page=100")
 	if err != nil {
 		return nil, err
 	}
-	p.targetReleases, err = getAll[release](r, "repos/"+target+"/releases?per_page=100")
+	p.targetReleases, err = getAll[release](r, r.target, "repos/"+target+"/releases?per_page=100")
 	if err != nil {
 		return nil, err
 	}
@@ -185,7 +269,7 @@ func (r *replicator) preflight(source, target string) (*plan, error) {
 		return nil, fmt.Errorf("target: %w", err)
 	}
 	var latest release
-	if err := r.call("GET", "repos/"+source+"/releases/latest", nil, &latest); err != nil {
+	if err := r.call(r.source, "GET", "repos/"+source+"/releases/latest", nil, &latest); err != nil {
 		if !isNotFound(err) {
 			return nil, err
 		}
@@ -218,10 +302,10 @@ func (r *replicator) syncGit(source, target string) error {
 
 	gitDir := filepath.Join(dir, "repo.git")
 	fmt.Fprintf(os.Stderr, "  Cloning %s...\n", source)
-	if err := r.command("", "git", "clone", "--bare", "https://github.com/"+source+".git", gitDir); err != nil {
+	if err := r.command("", r.source, "git", "clone", "--bare", "https://github.com/"+source+".git", gitDir); err != nil {
 		return fmt.Errorf("clone source: %w", err)
 	}
-	if err := r.command(gitDir, "git", "remote", "add", "replicate-target", "https://github.com/"+target+".git"); err != nil {
+	if err := r.command(gitDir, r.source, "git", "remote", "add", "replicate-target", "https://github.com/"+target+".git"); err != nil {
 		return fmt.Errorf("add destination remote: %w", err)
 	}
 	if err := r.checkLFS(gitDir); err != nil {
@@ -237,17 +321,17 @@ func (r *replicator) pushRefs(gitDir string) error {
 		args = append(args, "--dry-run")
 	}
 	args = append(args, "replicate-target", "refs/heads/*:refs/heads/*", "refs/tags/*:refs/tags/*")
-	if err := r.command(gitDir, "git", args...); err != nil {
+	if err := r.command(gitDir, r.target, "git", args...); err != nil {
 		return fmt.Errorf("push refs: %w", err)
 	}
 	return nil
 }
 
 func (r *replicator) syncMetadata(target string, p *plan) error {
-	if err := r.call("PATCH", "repos/"+target, jsonBody(p.repository), nil); err != nil {
+	if err := r.call(r.target, "PATCH", "repos/"+target, jsonBody(p.repository), nil); err != nil {
 		return fmt.Errorf("update metadata: %w", err)
 	}
-	if err := r.call("PUT", "repos/"+target+"/topics", jsonBody(map[string]any{"names": p.topics}), nil); err != nil {
+	if err := r.call(r.target, "PUT", "repos/"+target+"/topics", jsonBody(map[string]any{"names": p.topics}), nil); err != nil {
 		return fmt.Errorf("update topics: %w", err)
 	}
 	for _, l := range p.labels {
@@ -256,11 +340,11 @@ func (r *replicator) syncMetadata(target string, p *plan) error {
 			fmt.Fprintf(os.Stderr, "  Would upsert label %q\n", l.Name)
 			continue
 		}
-		if err := r.call("PATCH", path, jsonBody(l), nil); err != nil {
+		if err := r.call(r.target, "PATCH", path, jsonBody(l), nil); err != nil {
 			if !isNotFound(err) {
 				return fmt.Errorf("update label %q: %w", l.Name, err)
 			}
-			if err := r.call("POST", "repos/"+target+"/labels", jsonBody(l), nil); err != nil {
+			if err := r.call(r.target, "POST", "repos/"+target+"/labels", jsonBody(l), nil); err != nil {
 				return fmt.Errorf("create label %q: %w", l.Name, err)
 			}
 		}
@@ -284,11 +368,11 @@ func (r *replicator) syncReleases(target string, p *plan) error {
 			"make_latest": "false",
 		}
 		if exists {
-			if err := r.call("PATCH", fmt.Sprintf("repos/%s/releases/%d", target, dst.ID), jsonBody(payload), &dst); err != nil {
+			if err := r.call(r.target, "PATCH", fmt.Sprintf("repos/%s/releases/%d", target, dst.ID), jsonBody(payload), &dst); err != nil {
 				return fmt.Errorf("update release %s: %w", src.TagName, err)
 			}
 		} else {
-			if err := r.call("POST", "repos/"+target+"/releases", jsonBody(payload), &dst); err != nil {
+			if err := r.call(r.target, "POST", "repos/"+target+"/releases", jsonBody(payload), &dst); err != nil {
 				return fmt.Errorf("create release %s: %w", src.TagName, err)
 			}
 		}
@@ -305,7 +389,7 @@ func (r *replicator) syncReleases(target string, p *plan) error {
 		}
 		if r.dryRun {
 			fmt.Fprintf(os.Stderr, "  Would set Latest to release %s after reconciliation\n", p.latest)
-		} else if err := r.call("PATCH", fmt.Sprintf("repos/%s/releases/%d", target, dst.ID), jsonBody(map[string]string{"make_latest": "true"}), nil); err != nil {
+		} else if err := r.call(r.target, "PATCH", fmt.Sprintf("repos/%s/releases/%d", target, dst.ID), jsonBody(map[string]string{"make_latest": "true"}), nil); err != nil {
 			return fmt.Errorf("set Latest: %w", err)
 		}
 	}
@@ -337,7 +421,7 @@ func (r *replicator) syncAssets(target string, src, dst release) error {
 			defer os.Remove(tmp.Name())
 			defer tmp.Close()
 
-			if err := r.downloadAsset(a.URL, tmp); err != nil {
+			if err := r.downloadAsset(r.source, a.URL, tmp); err != nil {
 				return fmt.Errorf("download asset %s: %w", a.Name, err)
 			}
 			digest, err := verifyAsset(tmp, a)
@@ -358,7 +442,7 @@ func (r *replicator) syncAssets(target string, src, dst release) error {
 				return fmt.Errorf("rewind asset %s: %w", a.Name, err)
 			}
 			if exists {
-				if err := r.call("DELETE", fmt.Sprintf("repos/%s/releases/assets/%d", target, d.ID), nil, nil); err != nil {
+				if err := r.call(r.target, "DELETE", fmt.Sprintf("repos/%s/releases/assets/%d", target, d.ID), nil, nil); err != nil {
 					return fmt.Errorf("replace asset %s: %w", a.Name, err)
 				}
 			}
@@ -385,20 +469,20 @@ func (r *replicator) sameContent(a, d asset, digest string) (bool, error) {
 		return false, errors.New("destination asset URL is missing")
 	}
 	hash := sha256.New()
-	if err := r.downloadAsset(d.URL, hash); err != nil {
+	if err := r.downloadAsset(r.target, d.URL, hash); err != nil {
 		return false, err
 	}
 	return fmt.Sprintf("sha256:%x", hash.Sum(nil)) == digest, nil
 }
 
-func (r *replicator) downloadAsset(path string, dst io.Writer) error {
+func (r *replicator) downloadAsset(s side, path string, dst io.Writer) error {
 	req, err := http.NewRequestWithContext(r.ctx, http.MethodGet, path, nil)
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Accept", "application/octet-stream")
 
-	resp, err := r.httpClient.Do(req)
+	resp, err := s.httpClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -429,7 +513,7 @@ func (r *replicator) uploadAsset(target string, releaseID int64, name string, sr
 	req.Header.Set("Content-Type", contentType)
 	req.ContentLength = stat.Size()
 
-	resp, err := r.httpClient.Do(req)
+	resp, err := r.target.httpClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -464,10 +548,10 @@ func sameAsset(a, b asset) bool {
 	return false
 }
 
-func getAll[T any](r *replicator, path string) ([]T, error) {
+func getAll[T any](r *replicator, s side, path string) ([]T, error) {
 	var all []T
 	for {
-		resp, err := r.client.RequestWithContext(r.ctx, http.MethodGet, path, nil)
+		resp, err := s.client.RequestWithContext(r.ctx, http.MethodGet, path, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -493,13 +577,12 @@ func jsonBody(v any) io.Reader {
 	return &b
 }
 
-func (r *replicator) command(dir, name string, args ...string) error {
+func (r *replicator) command(dir string, s side, name string, args ...string) error {
 	ctx, cancel := context.WithTimeout(r.ctx, r.timeout)
 	defer cancel()
 
-	cmd := gitCommand(ctx, name, args...)
+	cmd := gitCommand(ctx, s.token, name, args...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 

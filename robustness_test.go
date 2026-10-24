@@ -19,17 +19,22 @@ import (
 	"github.com/cli/go-gh/v2/pkg/api"
 )
 
-func fakeAPI(t *testing.T, handler http.HandlerFunc) *replicator {
+func fakeServer(t *testing.T, handler http.HandlerFunc) string {
 	t.Helper()
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
-	u, _ := url.Parse(server.URL)
+	return server.URL
+}
+
+func fakeSide(t *testing.T, server, token string) side {
+	t.Helper()
+	u, _ := url.Parse(server)
 	transport := transportFunc(func(req *http.Request) (*http.Response, error) {
 		clone := req.Clone(req.Context())
 		clone.URL.Scheme, clone.URL.Host = u.Scheme, u.Host
 		return http.DefaultTransport.RoundTrip(clone)
 	})
-	opts := api.ClientOptions{Host: "github.com", AuthToken: "test-token", Transport: transport, Timeout: time.Second}
+	opts := api.ClientOptions{Host: "github.com", AuthToken: token, Transport: transport, Timeout: time.Second}
 	c, err := api.NewRESTClient(opts)
 	if err != nil {
 		t.Fatal(err)
@@ -38,7 +43,13 @@ func fakeAPI(t *testing.T, handler http.HandlerFunc) *replicator {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &replicator{client: c, httpClient: h, ctx: context.Background(), timeout: time.Minute}
+	return side{client: c, httpClient: h, token: token}
+}
+
+func fakeAPI(t *testing.T, handler http.HandlerFunc) *replicator {
+	t.Helper()
+	s := fakeSide(t, fakeServer(t, handler), "test-token")
+	return &replicator{source: s, target: s, ctx: context.Background(), timeout: time.Minute}
 }
 
 func captureStderr(t *testing.T, fn func()) string {
@@ -78,7 +89,7 @@ func TestPagination(t *testing.T) {
 			fmt.Fprint(w, `[{"name":"second"}]`)
 		}
 	})
-	labels, err := getAll[label](r, "first")
+	labels, err := getAll[label](r, r.source, "first")
 	if err != nil || len(labels) != 2 || labels[1].Name != "second" || calls != 2 {
 		t.Fatalf("pagination: %#v %v (%d calls)", labels, err, calls)
 	}
@@ -205,14 +216,14 @@ func TestRetryReadsOnly(t *testing.T) {
 
 func TestHTTPTimeoutAndCancellation(t *testing.T) {
 	r := fakeAPI(t, func(w http.ResponseWriter, req *http.Request) { <-req.Context().Done() })
-	r.httpClient.Timeout = 20 * time.Millisecond
-	if err := r.downloadAsset("https://api.github.com/slow", io.Discard); err == nil {
+	r.target.httpClient.Timeout = 20 * time.Millisecond
+	if err := r.downloadAsset(r.source, "https://api.github.com/slow", io.Discard); err == nil {
 		t.Fatal("missing HTTP timeout")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	r.ctx = ctx
-	if err := r.call("GET", "slow", nil, nil); err == nil {
+	if err := r.call(r.target, "GET", "slow", nil, nil); err == nil {
 		t.Fatal("missing REST cancellation")
 	}
 }
