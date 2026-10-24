@@ -23,6 +23,7 @@ const (
 // seamStub pins the entrypoint seams for one test and restores them after.
 func seamStub(t *testing.T) {
 	t.Helper()
+	isolateCache(t)
 	oldSide, oldRemote := newSide, gitRemote
 	t.Cleanup(func() { newSide, gitRemote = oldSide, oldRemote })
 }

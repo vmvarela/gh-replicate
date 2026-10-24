@@ -88,12 +88,19 @@ var tokenForAccount = func(login string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// Detect LFS pointers in all objects of the bare clone, including historical
-// versions. Copying only Git refs cannot make these large objects available.
+// Detect LFS pointers reachable from the branches and tags being pushed,
+// including historical versions, but excluding obsolete cached objects.
 func (r *replicator) checkLFS(dir string) error {
 	ctx, cancel := context.WithTimeout(r.ctx, r.timeout)
 	defer cancel()
-	check := gitCommand(ctx, "", "git", "cat-file", "--batch-all-objects", "--batch-check=%(objectname) %(objecttype) %(objectsize)")
+	reachable := gitCommand(ctx, "", "git", "rev-list", "--objects", "--no-object-names", "--branches", "--tags")
+	reachable.Dir = dir
+	objectIDs, err := reachable.Output()
+	if err != nil {
+		return fmt.Errorf("enumerate reachable Git objects for LFS: %w", err)
+	}
+	check := gitCommand(ctx, "", "git", "cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)")
+	check.Stdin = bytes.NewReader(objectIDs)
 	check.Dir = dir
 	objects, err := check.Output()
 	if err != nil {

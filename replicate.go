@@ -334,14 +334,11 @@ func (r *replicator) syncGit(source, target string) error {
 	// Share source objects across destinations without persisting credentials.
 	key := fmt.Sprintf("%x", sha256.Sum256([]byte(gitRemote(source))))
 	gitDir := filepath.Join(dir, key+".git")
-	lockDir := gitDir + ".lock"
-	if err := os.Mkdir(lockDir, 0700); err != nil {
-		if os.IsExist(err) {
-			return fmt.Errorf("source cache is locked: %s; retry later, or remove the lock only after confirming no replication is running", lockDir)
-		}
-		return fmt.Errorf("lock source cache: %w", err)
+	lock, err := lockCache(gitDir + ".lock")
+	if err != nil {
+		return err
 	}
-	defer os.Remove(lockDir)
+	defer lock.Close()
 
 	if err := os.MkdirAll(gitDir, 0700); err != nil {
 		return fmt.Errorf("create source cache: %w", err)
