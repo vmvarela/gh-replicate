@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -71,12 +72,20 @@ func gitRefs(t *testing.T, dir string) string {
 // fakeGitHubAPI serves the endpoints preflight reads. When writable, the
 // metadata writes of a real run are accepted and label PATCH returns 404 so
 // syncMetadata takes the POST path.
-func fakeGitHubAPI(t *testing.T, labelSet []label, writable bool) (string, *[]string) {
+func fakeGitHubAPI(t *testing.T, labelSet []label, writable bool, defaultBranch string) (string, *[]string, *string) {
 	t.Helper()
 	var methods []string
+	var metadataPatch string
 	server := fakeServer(t, func(w http.ResponseWriter, req *http.Request) {
 		methods = append(methods, req.Method+" "+req.URL.Path)
 		if req.Method != http.MethodGet {
+			if req.Method == http.MethodPatch && strings.Count(req.URL.Path, "/") == 3 {
+				body, err := io.ReadAll(req.Body)
+				if err != nil {
+					t.Error(err)
+				}
+				metadataPatch = string(body)
+			}
 			if !writable {
 				t.Errorf("unexpected write: %s %s", req.Method, req.URL.Path)
 				w.WriteHeader(http.StatusForbidden)
@@ -107,12 +116,14 @@ func fakeGitHubAPI(t *testing.T, labelSet []label, writable bool) (string, *[]st
 		case strings.HasSuffix(req.URL.Path, "/releases"):
 			fmt.Fprint(w, `[]`)
 		case strings.HasPrefix(req.URL.Path, "/repos/"):
-			fmt.Fprint(w, `{"description":"replicated","homepage":""}`)
+			if err := json.NewEncoder(w).Encode(repository{Description: "replicated", DefaultBranch: defaultBranch}); err != nil {
+				t.Error(err)
+			}
 		default:
 			t.Errorf("unexpected request: %s %s", req.Method, req.URL.Path)
 		}
 	})
-	return server, &methods
+	return server, &methods, &metadataPatch
 }
 
 // stubRun wires newSide and gitRemote to the fake servers and local bare repos.
@@ -225,8 +236,8 @@ func TestRunDryRunLeavesDestinationUntouched(t *testing.T) {
 	before := gitRefs(t, f.destination)
 
 	labels := []label{{Name: "bug", Color: "d73a4a", Description: "Something isn't working"}}
-	sourceURL, _ := fakeGitHubAPI(t, labels, false)
-	targetURL, targetMethods := fakeGitHubAPI(t, nil, false)
+	sourceURL, _, _ := fakeGitHubAPI(t, labels, false, "main")
+	targetURL, targetMethods, _ := fakeGitHubAPI(t, nil, false, "main")
 	stubRun(t, sourceURL, targetURL, f)
 
 	out := captureStderr(t, func() {
@@ -252,8 +263,8 @@ func TestRunReplicatesIntoDestination(t *testing.T) {
 	f := newGitFixture(t)
 
 	labels := []label{{Name: "bug", Color: "d73a4a", Description: "Something isn't working"}}
-	sourceURL, _ := fakeGitHubAPI(t, labels, false)
-	targetURL, targetMethods := fakeGitHubAPI(t, nil, true)
+	sourceURL, _, _ := fakeGitHubAPI(t, labels, false, "master")
+	targetURL, targetMethods, targetPatch := fakeGitHubAPI(t, nil, true, "main")
 	stubRun(t, sourceURL, targetURL, f)
 
 	out := captureStderr(t, func() {
@@ -276,6 +287,13 @@ func TestRunReplicatesIntoDestination(t *testing.T) {
 		if !strings.Contains(issued, want) {
 			t.Fatalf("missing metadata request %q in:\n%s", want, issued)
 		}
+	}
+	var patch map[string]any
+	if err := json.Unmarshal([]byte(*targetPatch), &patch); err != nil {
+		t.Fatalf("decode metadata patch %q: %v", *targetPatch, err)
+	}
+	if patch["default_branch"] != "master" {
+		t.Fatalf("default_branch = %v, want master from the source (destination had main)", patch["default_branch"])
 	}
 }
 
@@ -331,5 +349,31 @@ func TestSyncGitClonesAndPushesRefs(t *testing.T) {
 	}
 	if got, want := gitTest(t, f.destination, "rev-parse", "refs/tags/v1"), gitTest(t, f.source, "rev-parse", "refs/tags/v1"); got != want {
 		t.Fatalf("tag v1 = %s, want %s", got, want)
+	}
+}
+
+func TestSyncMetadataSetsDestinationDefaultBranch(t *testing.T) {
+	var patch string
+	server := fakeServer(t, func(w http.ResponseWriter, req *http.Request) {
+		if req.Method == http.MethodPatch {
+			body, err := io.ReadAll(req.Body)
+			if err != nil {
+				t.Error(err)
+			}
+			patch = string(body)
+		}
+		fmt.Fprint(w, `{}`)
+	})
+	r := &replicator{ctx: context.Background(), target: fakeSide(t, server, "test-token")}
+	p := &plan{repository: repository{Description: "d", DefaultBranch: "master"}}
+	if err := r.syncMetadata(targetRepo, p); err != nil {
+		t.Fatalf("sync metadata: %v", err)
+	}
+	var body map[string]string
+	if err := json.Unmarshal([]byte(patch), &body); err != nil {
+		t.Fatalf("decode patch %q: %v", patch, err)
+	}
+	if body["default_branch"] != "master" {
+		t.Fatalf("default_branch = %q, want master", body["default_branch"])
 	}
 }
