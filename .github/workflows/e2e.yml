@@ -1,0 +1,47 @@
+name: Replication E2E
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: Source repository (OWNER/REPO)
+        required: true
+        default: vmvarela/sql-pipe
+      target:
+        description: Target repository (OWNER/REPO)
+        required: true
+        default: vmvarela/sql-pipe-replica
+  pull_request:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+jobs:
+  replicate:
+    if: github.event_name == 'workflow_dispatch' || (github.event.label.name == 'run-e2e' && github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    concurrency:
+      group: replication-e2e
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.3'
+          cache: true
+      - name: Build extension
+        run: go build -o gh-replicate .
+      - name: Replicate repository
+        env:
+          GH_TOKEN: ${{ secrets.REPLICATION_TOKEN }}
+          SOURCE_REPOSITORY: ${{ inputs.source || 'vmvarela/sql-pipe' }}
+          TARGET_REPOSITORY: ${{ inputs.target || 'vmvarela/sql-pipe-replica' }}
+        run: |
+          ./gh-replicate "$SOURCE_REPOSITORY" "$TARGET_REPOSITORY"
+          python3 scripts/verify-e2e.py snapshot > /tmp/replica-before.json
+          ./gh-replicate "$SOURCE_REPOSITORY" "$TARGET_REPOSITORY"
+          python3 scripts/verify-e2e.py verify /tmp/replica-before.json
