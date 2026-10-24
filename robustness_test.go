@@ -269,3 +269,41 @@ func TestAtomicPushAndDryRun(t *testing.T) {
 		t.Fatal("pruned destination-only ref")
 	}
 }
+
+func TestCorruptDownloadPreservesExistingAsset(t *testing.T) {
+	writes := 0
+	r := fakeAPI(t, func(w http.ResponseWriter, req *http.Request) {
+		if req.Method != http.MethodGet {
+			writes++
+		}
+		fmt.Fprint(w, "bad")
+	})
+	src := release{Assets: []asset{{Name: "binary", Size: 3, Digest: "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", URL: "https://api.github.com/asset"}}}
+	dst := release{ID: 1, Assets: []asset{{ID: 2, Name: "binary", Size: 3, Digest: "sha256:old"}}}
+	err := r.syncAssets("a/b", src, dst)
+	if err == nil || !strings.Contains(err.Error(), "SHA-256") {
+		t.Fatalf("expected integrity error, got %v", err)
+	}
+	if writes != 0 {
+		t.Fatalf("corrupt download caused %d writes", writes)
+	}
+}
+
+func TestVerifyDownloadedAsset(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "asset")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := f.WriteString("abc"); err != nil {
+		t.Fatal(err)
+	}
+	a := asset{Name: "binary", Size: 3, Digest: "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"}
+	if err := verifyAsset(f, a); err != nil {
+		t.Fatal(err)
+	}
+	a.Size = 4
+	if err := verifyAsset(f, a); err == nil {
+		t.Fatal("accepted truncated download")
+	}
+}
