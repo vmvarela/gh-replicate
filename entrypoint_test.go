@@ -254,6 +254,56 @@ func testRepoID(name string) int64 {
 	return int64(h.Sum64() >> 1)
 }
 
+func TestRunRejectsUnknownRepositoryID(t *testing.T) {
+	for _, tc := range []struct {
+		name, missing string
+		dryRun        bool
+	}{
+		{"source ID missing", sourceRepo, false},
+		{"target ID missing", targetRepo, false},
+		{"source ID missing in dry run", sourceRepo, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("GH_HOST", "github.com")
+			f := newGitFixture(t)
+			before := gitRefs(t, f.destination)
+
+			var methods []string
+			serverURL := fakeServer(t, func(w http.ResponseWriter, req *http.Request) {
+				methods = append(methods, req.Method)
+				switch {
+				case req.URL.Path == "/user":
+					fmt.Fprint(w, `{"login":"alice"}`)
+				case req.URL.Path == "/repos/"+tc.missing:
+					fmt.Fprint(w, `{"id":0,"description":"","default_branch":"main"}`)
+				case strings.HasPrefix(req.URL.Path, "/repos/"):
+					fmt.Fprint(w, `{"id":7691631,"description":"","default_branch":"main"}`)
+				default:
+					t.Errorf("unexpected request: %s %s", req.Method, req.URL.Path)
+				}
+			})
+			stubRun(t, serverURL, serverURL, f)
+
+			args := []string{sourceRepo, targetRepo}
+			if tc.dryRun {
+				args = append([]string{"--dry-run"}, args...)
+			}
+			err := run(args)
+			if err == nil || !strings.Contains(err.Error(), "cannot read the repository IDs") {
+				t.Fatalf("error = %v, want an abort for a missing repository ID", err)
+			}
+			if after := gitRefs(t, f.destination); after != before {
+				t.Fatalf("destination refs changed:\nbefore %q\nafter  %q", before, after)
+			}
+			for _, method := range methods {
+				if method != http.MethodGet {
+					t.Fatalf("a mutating request escaped preflight: %s", method)
+				}
+			}
+		})
+	}
+}
+
 func TestRunRejectsOneRepositoryBehindTwoNames(t *testing.T) {
 	t.Setenv("GH_HOST", "github.com")
 	f := newGitFixture(t)
