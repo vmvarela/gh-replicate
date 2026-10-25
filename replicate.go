@@ -259,13 +259,26 @@ func (r *replicator) preflight(source, target string) (*plan, error) {
 		return nil, err
 	}
 	p := &plan{}
-	if err := r.call(r.source, "GET", "repos/"+source, nil, &p.repository); err != nil {
+	// A renamed repository keeps redirecting, so two names can be one repository.
+	// Compare IDs before anything else, or the run would disable Actions on the
+	// source and force-push onto it.
+	var src, dst struct {
+		repository
+		ID int64 `json:"id"`
+	}
+	if err := r.call(r.source, "GET", "repos/"+source, nil, &src); err != nil {
 		return nil, err
 	}
-	var dst repository
 	if err := r.call(r.target, "GET", "repos/"+target, nil, &dst); err != nil {
 		return nil, err
 	}
+	if src.ID == 0 || dst.ID == 0 {
+		return nil, fmt.Errorf("cannot read the repository IDs of %s and %s; refusing to replicate without proving they are different", source, target)
+	}
+	if src.ID == dst.ID {
+		return nil, fmt.Errorf("%s and %s are the same repository (id %d); a renamed repository redirects to its new name, so replicating would overwrite the source", source, target, src.ID)
+	}
+	p.repository = src.repository
 	var srcTopics, dstTopics struct {
 		Names []string `json:"names"`
 	}

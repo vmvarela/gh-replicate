@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net/http"
 	"os"
@@ -124,7 +125,12 @@ func fakeGitHubAPI(t *testing.T, labelSet []label, writable bool, defaultBranch 
 		case strings.HasSuffix(req.URL.Path, "/releases"):
 			fmt.Fprint(w, `[]`)
 		case strings.HasPrefix(req.URL.Path, "/repos/"):
-			if err := json.NewEncoder(w).Encode(repository{Description: "replicated", DefaultBranch: defaultBranch}); err != nil {
+			payload := map[string]any{
+				"id":             testRepoID(strings.TrimPrefix(req.URL.Path, "/repos/")),
+				"description":    "replicated",
+				"default_branch": defaultBranch,
+			}
+			if err := json.NewEncoder(w).Encode(payload); err != nil {
 				t.Error(err)
 			}
 		default:
@@ -234,6 +240,51 @@ func TestRunLeavesDestinationUntouchedWhenPreflightFails(t *testing.T) {
 	for _, method := range targetMethods {
 		if method != http.MethodGet {
 			t.Fatalf("destination received a mutating request: %s", method)
+		}
+	}
+}
+
+// testRepoID derives a stable ID from a repository name so that separate fake
+// servers agree on identity, the way GitHub does.
+func testRepoID(name string) int64 {
+	h := fnv.New64a()
+	if _, err := h.Write([]byte(name)); err != nil {
+		panic(err)
+	}
+	return int64(h.Sum64() >> 1)
+}
+
+func TestRunRejectsOneRepositoryBehindTwoNames(t *testing.T) {
+	t.Setenv("GH_HOST", "github.com")
+	f := newGitFixture(t)
+	before := gitRefs(t, f.destination)
+
+	// GitHub answers both names with the same repository ID when the source was
+	// renamed, which is exactly what a name-only check misses.
+	var methods []string
+	serverURL := fakeServer(t, func(w http.ResponseWriter, req *http.Request) {
+		methods = append(methods, req.Method)
+		switch {
+		case req.URL.Path == "/user":
+			fmt.Fprint(w, `{"login":"alice"}`)
+		case strings.HasPrefix(req.URL.Path, "/repos/"):
+			fmt.Fprint(w, `{"id":7691631,"description":"","default_branch":"main"}`)
+		default:
+			t.Errorf("unexpected request: %s %s", req.Method, req.URL.Path)
+		}
+	})
+	stubRun(t, serverURL, serverURL, f)
+
+	err := run([]string{sourceRepo, targetRepo})
+	if err == nil || !strings.Contains(err.Error(), "same repository") {
+		t.Fatalf("error = %v, want an abort for one repository behind two names", err)
+	}
+	if after := gitRefs(t, f.destination); after != before {
+		t.Fatalf("destination refs changed:\nbefore %q\nafter  %q", before, after)
+	}
+	for _, method := range methods {
+		if method != http.MethodGet {
+			t.Fatalf("a mutating request escaped preflight: %s", method)
 		}
 	}
 }
