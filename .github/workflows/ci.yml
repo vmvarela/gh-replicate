@@ -30,8 +30,17 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        goos: [linux, darwin, windows]
-        goarch: [amd64, arm64]
+        # Keep this in step with cli/gh-extension-precompile: a missing platform
+        # here only shows up as a failed release after publication.
+        goos: [linux, darwin, windows, freebsd, netbsd, openbsd, solaris, plan9]
+        goarch: [amd64]
+        include:
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: arm64
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
