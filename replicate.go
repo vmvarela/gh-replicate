@@ -348,7 +348,8 @@ func (r *replicator) syncGit(source, target string) error {
 		return fmt.Errorf("create source cache: %w", err)
 	}
 	// init is idempotent, including after an interrupted first initialization.
-	if err := r.command("", r.source, "git", "init", "--bare", "--quiet", gitDir); err != nil {
+	// Pin SHA-1 like GitHub, so a local sha256 default cannot break the fetch.
+	if err := r.command("", r.source, "git", "init", "--bare", "--quiet", "--object-format=sha1", gitDir); err != nil {
 		return fmt.Errorf("initialize source cache: %w", err)
 	}
 	if err := r.command(gitDir, r.target, "git", "config", "--local",
@@ -360,7 +361,9 @@ func (r *replicator) syncGit(source, target string) error {
 	// Prune stale source refs locally so deleted source refs are never pushed
 	// back. The destination push does not prune destination-only refs.
 	// Fetch must succeed on every run; never push a stale cache after failure.
-	if err := r.command(gitDir, r.source, "git", "fetch", "--atomic", "--prune", "--no-tags",
+	// Not --atomic: a rename like release -> release/v2 cannot delete and create
+	// in one transaction, and that failure would persist in the shared cache.
+	if err := r.command(gitDir, r.source, "git", "fetch", "--prune", "--no-tags",
 		gitRemote(source),
 		"+refs/heads/*:refs/heads/*",
 		"+refs/tags/*:refs/tags/*"); err != nil {

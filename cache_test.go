@@ -115,6 +115,14 @@ func TestSyncGitCacheLifecycle(t *testing.T) {
 			t.Fatalf("lost destination ref %s", ref)
 		}
 	}
+	// A cached ref the source renamed into its own path must not block the
+	// fetch: one atomic fetch cannot delete and create these refs together.
+	gitTest(t, caches[0], "update-ref", "refs/heads/release", base)
+	gitTest(t, f.source, "update-ref", "refs/heads/release/v2", base)
+	sync()
+	if got := gitTest(t, f.destination, "rev-parse", "refs/heads/release/v2"); got != base {
+		t.Fatalf("renamed ref %s", got)
+	}
 	// A stale push would recreate this ref, making the assertion observable.
 	gitTest(t, f.destination, "update-ref", "-d", "refs/heads/main")
 	before := gitRefs(t, f.destination)
@@ -285,6 +293,35 @@ func TestSyncGitNewObjectsAndSecondTarget(t *testing.T) {
 	caches, err := filepath.Glob(filepath.Join(root, "gh-replicate", "git-v1", "*.git"))
 	if err != nil || len(caches) != 1 {
 		t.Fatalf("expected shared source cache: %v %v", caches, err)
+	}
+}
+
+// A local SHA-256 default must not leak into the cache: GitHub serves SHA-1.
+func TestSyncGitPinsSHA1ObjectFormat(t *testing.T) {
+	f := newGitFixture(t)
+	seamStub(t)
+	t.Setenv("GIT_DEFAULT_HASH", "sha256")
+	gitRemote = func(repo string) string {
+		if repo == sourceRepo {
+			return f.source
+		}
+		return f.destination
+	}
+	s := fakeSide(t, fakeServer(t, func(w http.ResponseWriter, req *http.Request) { fmt.Fprint(w, `{"enabled":false}`) }), "token")
+	r := &replicator{source: s, target: s, ctx: context.Background(), timeout: time.Minute}
+	if err := r.syncGit(sourceRepo, targetRepo); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.UserCacheDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	caches, err := filepath.Glob(filepath.Join(root, "gh-replicate", "git-v1", "*.git"))
+	if err != nil || len(caches) != 1 {
+		t.Fatalf("caches %v: %v", caches, err)
+	}
+	if got := gitTest(t, caches[0], "rev-parse", "--show-object-format"); got != "sha1" {
+		t.Fatalf("cache object format %s", got)
 	}
 }
 

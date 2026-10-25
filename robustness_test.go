@@ -230,7 +230,8 @@ func TestHTTPTimeoutAndCancellation(t *testing.T) {
 
 func gitTest(t *testing.T, dir string, args ...string) string {
 	t.Helper()
-	cmd := exec.Command("git", args...)
+	// Detached auto-maintenance keeps writing into .git past the end of a test.
+	cmd := exec.Command("git", append([]string{"-c", "gc.auto=0", "-c", "maintenance.auto=false"}, args...)...)
 	cmd.Dir = dir
 	out, err := cmd.CombinedOutput()
 	if err != nil {
