@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -50,6 +52,7 @@ type asset struct {
 	ID     int64  `json:"id"`
 	Name   string `json:"name"`
 	Size   int64  `json:"size"`
+	State  string `json:"state"`
 	Digest string `json:"digest"`
 	URL    string `json:"url"`
 }
@@ -66,6 +69,7 @@ type side struct {
 
 type replicator struct {
 	cacheLock *os.File
+	cacheDir  string
 	source    side
 	target    side
 	ctx       context.Context
@@ -472,20 +476,53 @@ func (r *replicator) syncReleases(target string, p *plan) error {
 	return nil
 }
 
+const stagedSuffix = ".gh-replicate-"
+
+// maxAssetName is conservative: GitHub rejects overlong asset names without
+// documenting the exact limit, and a rejected staging name would repeat.
+const maxAssetName = 255
+
+// stagedAssetName is random, never derived from content or a canonical name
+// alone: ownership comes from the journal entry written before the upload.
+func stagedAssetName(name string, existing map[string]asset) (string, error) {
+	for i := 0; i < 8; i++ {
+		var b [4]byte
+		if _, err := rand.Read(b[:]); err != nil {
+			return "", fmt.Errorf("generate staging name: %w", err)
+		}
+		candidate := name + stagedSuffix + hex.EncodeToString(b[:])
+		// A free name before the upload is part of the ownership proof: a
+		// conflict on a name that was already taken is not our asset.
+		if _, taken := existing[candidate]; !taken {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("asset %s: no free staging name after 8 attempts", name)
+}
+
 func (r *replicator) syncAssets(target string, src, dst release) error {
 	existing := make(map[string]asset, len(dst.Assets))
+	known := make(map[int64]bool, len(dst.Assets))
 	for _, a := range dst.Assets {
 		existing[a.Name] = a
+		known[a.ID] = true
 	}
 
+	var journal *assetJournal
+	defer func() {
+		if journal != nil {
+			journal.Close()
+		}
+	}()
+
 	for _, a := range src.Assets {
-		d, exists := existing[a.Name]
-		if exists && sameAsset(a, d) {
+		current, exists := existing[a.Name]
+		if exists && sameAsset(a, current) {
 			fmt.Fprintf(os.Stderr, "    Asset %s unchanged.\n", a.Name)
 			continue
 		}
 		if r.dryRun {
-			fmt.Fprintf(os.Stderr, "    Would upload/replace asset %s\n", a.Name)
+			fmt.Fprintf(os.Stderr, "    Would stage asset %s, delete the current copy and rename it.\n", a.Name)
 			continue
 		}
 		fmt.Fprintf(os.Stderr, "    Replicating asset %s...\n", a.Name)
@@ -505,7 +542,7 @@ func (r *replicator) syncAssets(target string, src, dst release) error {
 				return err
 			}
 			if exists {
-				equal, err := r.sameContent(a, d, digest)
+				equal, err := r.sameContent(a, current, digest)
 				if err != nil {
 					return fmt.Errorf("compare asset %s: %w", a.Name, err)
 				}
@@ -517,13 +554,73 @@ func (r *replicator) syncAssets(target string, src, dst release) error {
 			if _, err := tmp.Seek(0, io.SeekStart); err != nil {
 				return fmt.Errorf("rewind asset %s: %w", a.Name, err)
 			}
-			if exists {
-				if err := r.call(r.target, "DELETE", fmt.Sprintf("repos/%s/releases/assets/%d", target, d.ID), nil, nil); err != nil {
-					return fmt.Errorf("replace asset %s: %w", a.Name, err)
+			if journal == nil {
+				j, err := openJournal(r.cacheDir, target)
+				if err != nil {
+					return err
+				}
+				journal = j
+			}
+
+			// Stage the new bytes, verify them, then delete the previous asset and
+			// rename the staged one into place. GitHub has no atomic swap; this
+			// order never removes the only copy before a verified replacement exists.
+			var staged asset
+			hasStaged := false
+			if entry, ok := journal.get(dst.ID, a.Name); ok {
+				if cand, found := existing[entry.Staged]; found {
+					staged, hasStaged = cand, true
+				} else {
+					fmt.Fprintf(os.Stderr, "    Journal entry %q is stale; staging again.\n", entry.Staged)
+					if err := journal.del(dst.ID, a.Name); err != nil {
+						return err
+					}
 				}
 			}
-			if err := r.uploadAsset(target, dst.ID, a.Name, tmp, digest); err != nil {
-				return fmt.Errorf("upload asset %s: %w", a.Name, err)
+			if hasStaged {
+				// Never delete it here: after a failed rename it can be the only
+				// full copy, and a read error does not prove it is corrupt.
+				if err := r.verifyStaged(target, staged, digest); err != nil {
+					fmt.Fprintf(os.Stderr, "    Staged asset %q does not verify (%v); leaving it in place and staging again.\n", staged.Name, err)
+					hasStaged = false
+				}
+			}
+			if !hasStaged {
+				name, err := stagedAssetName(a.Name, existing)
+				if err != nil {
+					return err
+				}
+				if len(name) > maxAssetName {
+					return fmt.Errorf("asset %s: staging name is %d characters, over the %d limit", a.Name, len(name), maxAssetName)
+				}
+				if err := journal.set(dst.ID, a.Name, journalEntry{Staged: name}); err != nil {
+					return err
+				}
+				uploaded, err := r.uploadAsset(target, dst.ID, name, a.Name, tmp, digest)
+				if err != nil {
+					found, ok, findErr := r.findAsset(target, dst.ID, name)
+					if findErr != nil || !ok || known[found.ID] {
+						return fmt.Errorf("stage asset %s as %q: %w (the upload outcome is unknown; a rerun reads the release before writing again)", a.Name, name, err)
+					}
+					fmt.Fprintf(os.Stderr, "    Asset %s reached %q despite the upload error.\n", a.Name, name)
+					uploaded = found
+				}
+				staged, hasStaged = uploaded, true
+				existing[name] = staged
+			}
+			if err := r.verifyStaged(target, staged, digest); err != nil {
+				return err
+			}
+			if exists {
+				if err := r.deleteAsset(target, current); err != nil {
+					return fmt.Errorf("asset %s is staged as %q with verified bytes; removing the previous copy failed and it may or may not still exist: %w", a.Name, staged.Name, err)
+				}
+			}
+			if err := r.renameAsset(target, staged, a.Name); err != nil {
+				return fmt.Errorf("asset %s is staged as %q with verified bytes; the rename failed and may have been applied: %w (a rerun reads the release first)", a.Name, staged.Name, err)
+			}
+			if err := journal.del(dst.ID, a.Name); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: asset %s was replaced but its journal entry could not be cleared: %v\n", a.Name, err)
 			}
 			return nil
 		}(); err != nil {
@@ -531,6 +628,52 @@ func (r *replicator) syncAssets(target string, src, dst release) error {
 		}
 	}
 	return nil
+}
+
+// verifyStaged proves the staged bytes are the ones we meant to publish before
+// anything is deleted. Upload responses may omit the digest, so fall back to
+// downloading the asset.
+func (r *replicator) verifyStaged(target string, a asset, digest string) error {
+	if a.Digest != "" {
+		if a.Digest != digest {
+			return fmt.Errorf("staged asset %q has digest %s, want %s; the previous copy is kept", a.Name, a.Digest, digest)
+		}
+		return nil
+	}
+	if a.URL == "" {
+		return fmt.Errorf("staged asset %q has no digest or URL; the previous copy is kept", a.Name)
+	}
+	hash := sha256.New()
+	if err := r.downloadAsset(r.target, a.URL, hash); err != nil {
+		return fmt.Errorf("verify staged asset %q: %w", a.Name, err)
+	}
+	if got := fmt.Sprintf("sha256:%x", hash.Sum(nil)); got != digest {
+		return fmt.Errorf("staged asset %q has digest %s, want %s; the previous copy is kept", a.Name, got, digest)
+	}
+	return nil
+}
+
+func (r *replicator) renameAsset(target string, a asset, name string) error {
+	return r.call(r.target, "PATCH", fmt.Sprintf("repos/%s/releases/assets/%d", target, a.ID), jsonBody(map[string]string{"name": name}), nil)
+}
+
+func (r *replicator) deleteAsset(target string, a asset) error {
+	return r.call(r.target, "DELETE", fmt.Sprintf("repos/%s/releases/assets/%d", target, a.ID), nil, nil)
+}
+
+// findAsset reads the release again to reconcile an upload whose outcome the
+// response did not settle.
+func (r *replicator) findAsset(target string, releaseID int64, name string) (asset, bool, error) {
+	assets, err := getAll[asset](r, r.target, fmt.Sprintf("repos/%s/releases/%d/assets?per_page=100", target, releaseID))
+	if err != nil {
+		return asset{}, false, err
+	}
+	for _, a := range assets {
+		if a.Name == name {
+			return a, true, nil
+		}
+	}
+	return asset{}, false, nil
 }
 
 // sameContent hashes the destination only when its digest cannot decide.
@@ -570,13 +713,13 @@ func (r *replicator) downloadAsset(s side, path string, dst io.Writer) error {
 	return err
 }
 
-func (r *replicator) uploadAsset(target string, releaseID int64, name string, src *os.File, digest string) error {
+func (r *replicator) uploadAsset(target string, releaseID int64, name, mediaName string, src *os.File, digest string) (asset, error) {
 	stat, err := src.Stat()
 	if err != nil {
-		return err
+		return asset{}, err
 	}
 
-	contentType := mime.TypeByExtension(filepath.Ext(name))
+	contentType := mime.TypeByExtension(filepath.Ext(mediaName))
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}
@@ -584,37 +727,37 @@ func (r *replicator) uploadAsset(target string, releaseID int64, name string, sr
 	path := fmt.Sprintf("https://uploads.github.com/repos/%s/releases/%d/assets?name=%s", target, releaseID, url.QueryEscape(name))
 	req, err := http.NewRequestWithContext(r.ctx, http.MethodPost, path, io.LimitReader(src, stat.Size()))
 	if err != nil {
-		return err
+		return asset{}, err
 	}
 	req.Header.Set("Content-Type", contentType)
 	req.ContentLength = stat.Size()
 
 	resp, err := r.target.httpClient.Do(req)
 	if err != nil {
-		return err
+		return asset{}, err
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 	if err != nil {
-		return fmt.Errorf("read asset response: %w", err)
+		return asset{}, fmt.Errorf("read asset response: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		if len(body) > 4096 {
 			body = body[:4096]
 		}
-		return fmt.Errorf("asset request failed: HTTP %d: %q", resp.StatusCode, body)
+		return asset{}, fmt.Errorf("asset request failed: HTTP %d: %q", resp.StatusCode, body)
 	}
 	var uploaded asset
 	if err := json.Unmarshal(body, &uploaded); err != nil {
-		return fmt.Errorf("decode asset response: %w (body %q)", err, body)
+		return asset{}, fmt.Errorf("decode asset response: %w (body %q)", err, body)
 	}
 	if uploaded.Size != stat.Size() {
-		return fmt.Errorf("asset %s: uploaded size %d, expected %d", name, uploaded.Size, stat.Size())
+		return uploaded, fmt.Errorf("asset %s: uploaded size %d, expected %d", name, uploaded.Size, stat.Size())
 	}
 	if strings.HasPrefix(uploaded.Digest, "sha256:") && uploaded.Digest != digest {
-		return fmt.Errorf("asset %s: uploaded SHA-256 differs from source", name)
+		return uploaded, fmt.Errorf("asset %s: uploaded SHA-256 differs from source", name)
 	}
-	return nil
+	return uploaded, nil
 }
 
 func sameAsset(a, b asset) bool {
