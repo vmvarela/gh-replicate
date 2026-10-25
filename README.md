@@ -1,58 +1,39 @@
 # gh-replicate
 
-A GitHub CLI extension that replicates Git repositories and selected GitHub metadata from a source repository to an existing destination repository.
+Copy a GitHub repository into another one that already exists: branches, tags, releases with their assets, and the main repository metadata, from a single command in GitHub CLI.
 
-## What it replicates
+Use it to keep a mirror, a staging copy or a public fork in sync with a repository you control.
 
-`gh replicate SOURCE TARGET` synchronizes:
+## What it copies
 
-- branches and tags, overwriting matching destination refs while preserving destination-only refs;
-- GitHub Releases and their uploaded assets;
-- repository description and homepage;
-- topics;
-- labels.
+- Branches and tags. Matching destination refs are overwritten; destination-only refs are kept.
+- Releases, their uploaded assets and the Latest selection.
+- Description, homepage and topics.
+- Labels.
 
-The destination repository must already exist. Public and private repositories are supported when they are accessible to the account used for each side.
+It does not touch issues, pull requests, discussions, wikis, permissions, secrets, variables, rulesets, branch protection, Actions artifacts or Packages. Release authors and publication dates are not copied.
 
-Issues, pull requests, discussions, Actions run history and settings, permissions, secrets, variables, rulesets, branch protection, Actions artifacts, and GitHub Packages are intentionally out of scope.
+## Requirements
 
-## Installation
+- GitHub CLI installed and authenticated with `gh auth login`.
+- `git` 2.29 or newer in `PATH`.
+- A destination repository that already exists and that you can write to. Changing its default branch and disabling its Actions needs administration write access.
+- github.com only. GitHub Enterprise Server and cross-instance replication are not supported.
 
-### Requirements
-
-Install and authenticate GitHub CLI first:
-
-```sh
-gh auth login
-```
-
-`git` must also be available in your PATH.
-
-### Install the extension
-
-Once the first release is published, install the latest version directly with GitHub CLI:
+## Install
 
 ```sh
 gh extension install vmvarela/gh-replicate
 ```
 
-GitHub CLI will use the precompiled binary from the latest release when available.
-
-To upgrade later:
+To upgrade or remove it later:
 
 ```sh
 gh extension upgrade replicate
-```
-
-To remove it:
-
-```sh
 gh extension remove replicate
 ```
 
-### Install from source during development
-
-Clone the repository, build the extension binary, and install the local checkout:
+To run a local build instead:
 
 ```sh
 git clone https://github.com/vmvarela/gh-replicate.git
@@ -61,77 +42,50 @@ go build -o gh-replicate .
 gh extension install .
 ```
 
-## Usage
-
-Both repositories use `OWNER/REPO` notation:
+## Use
 
 ```sh
 gh replicate [--dry-run] [--timeout 30m] [--source-account LOGIN] [--target-account LOGIN] SOURCE TARGET
 ```
 
-For example:
+Both repositories use `OWNER/REPO`. Start with a dry run, which reads the source and reports what it would change without writing to the destination:
 
 ```sh
+gh replicate --dry-run vmvarela/project vmvarela/project-replica
 gh replicate vmvarela/project vmvarela/project-replica
 ```
 
-The destination repository must already exist. Matching source branches, tags, releases, assets, metadata, topics, and labels are synchronized, and the destination default branch is set to the source's, which requires a token allowed to change repository settings. Destination-only branches, tags, releases, assets, and labels are preserved.
+A real run disables the destination's GitHub Actions before pushing, so a push cannot start workflows from the copied files, and then sets the destination default branch to the source's. It reports both changes when they happen; already running workflows are not cancelled.
 
-Running the command again is safe: unchanged release assets are detected and skipped.
-
-Git objects are retained in a bare source cache under the OS user cache directory (`gh-replicate/git-v1`). The first run downloads the source history; later runs fetch only missing objects and reuse the cache across destinations. The target is never cloned. Matching refs are force-pushed atomically and destination-only refs remain untouched. A successful source fetch is required on every run, so an unavailable source never causes a stale cache to be pushed.
-
-The cache contains repository contents, including private history, but no credentials. Its directories are created with owner-only permissions on systems supporting Unix permissions. A per-source OS file lock prevents concurrent use; a second run fails with the lock path. Git commands inherit the lock, so killing the parent does not allow another run to reuse the cache while an active command still holds it. The OS releases ownership when the last holder exits. The lock file remains on disk and must not be deleted while a replication is running. You can delete the cache while idle to reclaim disk space; the next run downloads the history again. Dry runs also populate the local cache. Ephemeral CI runners need to persist this directory between jobs to benefit from incremental downloads; restrict cache access appropriately for private repositories.
-
-A push can start the destination's GitHub Actions workflows, including one introduced by the same push. Once the source has been validated and the push is about to happen, `gh replicate` disables Actions in the destination when they are enabled and reports it; that needs administration write access, the same permission that changing the default branch needs. If the setting cannot be read or the update is rejected, the run warns and continues, and the remaining option is manual: **Settings > Actions > General > Actions permissions > Disable actions > Save**. A dry run only reports the update it would send. Runs that already started are not cancelled.
+Running the command again is normal and safe. Matching refs are force-pushed as one atomic update, unchanged release assets are detected by digest and skipped, and content that exists only in the destination is preserved. Git refs, metadata and releases are not one global transaction, so a failure partway through can leave some metadata unsynchronised; run the command again to finish.
 
 ### Replicating between two accounts
 
-Each side can use a different account that is already authenticated on this machine:
+Each side can use a different account that is already logged in on your machine:
 
 ```sh
-gh auth login --hostname github.com   # repeat for the second account
-gh auth status                        # both accounts must be listed
+gh auth login --hostname github.com   # once per account
 gh replicate --source-account alice --target-account bob alice/project bob/project-replica
 ```
 
-Both flags are optional and independent: without them the globally active account is used, exactly as before. The stored token of a requested account is read with `gh auth token --user`; the active account, the `gh` credential storage and the global Git configuration are never modified.
+Both flags are optional and independent; without them the active account is used. The tokens come from the accounts `gh` already stores, so the active account, the stored credentials and your Git configuration are not modified. Each side's login is verified before anything is written, and a mismatch stops the run.
 
-Before cloning or writing anything, the run reports the account each side authenticates as:
+## Limits
 
-```text
-Source identity: alice (gh auth token --user alice)
-Target identity: bob (gh auth token --user bob)
-```
+- **Check the direction.** Source wins for matching refs. A dry run reports what would change; it does not guarantee that server-side protections will accept the push.
+- **Ref renames can be blocked.** Replacing `release` with `release/v2` fails while `release` still exists in the destination, because destination-only refs are never deleted. Delete or rename it, then rerun.
+- **Git LFS content is not copied.** A repository that uses LFS stops before any destination change, including for pointers in its history.
+- **Some assets need a second step.** A changed release asset is uploaded under a temporary name, verified, then swapped in, so its name is briefly missing. An interrupted run leaves either the previous asset or the verified replacement; a rerun finishes the work, and a leftover temporary asset may need deleting from the release.
+- **Invalid input stops the run before any write.** More than 20 topics, an empty release tag or a duplicated release tag, including drafts, abort the replication. Releases are matched by tag.
+- **Retries are bounded.** Read requests retry twice for selected transient failures and short rate limits; write requests are never replayed automatically, so rerun instead.
+- **`--timeout 30m` applies per Git command or HTTP request**, not to the whole replication. Raise it for large repositories or assets. Ctrl-C cancels pending work.
 
-When both sides resolve to the same account it prints a single line. An account that is not logged in fails with `no oauth token found for github.com account <login>`, and a side whose token authenticates as a different login aborts before any change. If the account exists but cannot read or write a repository, the API or Git step fails with GitHub's error and replication stops there.
+## Local cache
 
-## Operational behavior and limits
+The source history is kept in a bare repository under your OS user cache directory (`gh-replicate/git-v1`), so later runs and other destinations only download what is missing. The cache holds repository contents, including private history, with owner-only permissions and no credentials.
 
-- **github.com only.** GHES and cross-instance replication are not supported. Set `GH_HOST=github.com` when another host is your default.
-- **Source wins for matching refs.** Double-check the direction. Use `gh replicate --dry-run SOURCE TARGET` first: it reads metadata, updates the local source cache, checks LFS and runs `git push --dry-run`, but makes no destination changes. It reports planned reconciliation, not a guarantee that server-side protections will accept a real push.
-- **Atomic Git push.** All branch/tag updates succeed together or the push fails. There is no fallback to a partial push and no destination pruning. Git refs, GitHub metadata and releases do not form one global transaction; failures after the push may leave partial metadata replication. Rerun to reconcile.
-- **Renaming a ref can be blocked by the destination.** Preserved destination refs still occupy their names, so replacing `release` with `release/v2` fails while `release` exists; delete or rename it, then rerun. Actions may already be disabled by the failed run.
-- **Git 2.29 or newer.** The cache pins the SHA-1 object format at initialization, which that version introduced.
-- **No global Git configuration changes.** Authentication uses the GitHub CLI credential helper scoped to each Git subprocess.
-- **One account per side.** `--source-account` and `--target-account` select already-authenticated `gh` accounts; each side's token goes to its own API client and Git subprocess, and both logins are verified with `GET /user` before the clone. Nothing is written to `gh` auth state or global Git configuration.
-- **LFS is not copied.** A preflight scan of Git objects reachable from source branches and tags rejects LFS pointers, including historical ones, before destination changes. The scan streams object IDs and metadata through pipes rather than buffering complete lists; it still traverses reachable history on every run.
-- **Preflight validation.** More than 20 combined topics, empty release tags or duplicate release tags (including drafts) stop replication before writes. The source and target must resolve to different repository IDs, because GitHub redirects renamed and transferred repositories; if either ID cannot be read, the run stops before any write. No topics are silently dropped.
-- **Latest is preserved.** The source's explicitly selected Latest release is applied after releases/assets succeed. If the source has no Latest, destination-only releases are preserved and no Latest selection is imposed.
-- **Timeout and cancellation.** `--timeout 30m` sets the limit per Git command or HTTP request, not for the entire replication. Use a larger duration for large repositories/assets. Ctrl-C cancels pending work.
-- **Bounded read retries.** GET requests retry at most twice for selected transient HTTP failures and rate limits, respecting server delays up to 30 seconds. Longer rate limits fail rather than retry early. Mutating requests are never replayed automatically after uncertain failures; rerun the command to reconcile.
-- **Asset replacement is recoverable, not atomic.** A changed asset is first uploaded under `<name>.gh-replicate-<8 random hex characters>`, its bytes are verified (by digest, or by downloading the asset when the upload response has none), and only then is the previous asset deleted and the staged copy renamed to the canonical name. The canonical name stays available during the upload and is missing only between that delete and the rename, so an interruption leaves either the previous asset or the verified staged copy. Ownership is not inferred from the name or the content, because a user can publish both: before each upload the tool records the chosen name, checked to be free in the release it just read, in `<user cache>/gh-replicate/staged-v1/`, and a rerun reuses only an asset that record names and that still verifies. A staged asset that no longer verifies is left in place rather than deleted, because after an interrupted rename it can be the only full copy. Keep that journal: without it the tool cannot tell its own staging from a user asset, so check the release before deleting entries from that directory. Staged-looking assets without a record, and destination-only assets, are never touched. When an upload outcome is unknown, the release is read again before anything else happens, and an asset is adopted only if its ID was not in the release the run read. Unchanged assets are detected by digest; when a digest is missing, equal-sized destination content is downloaded and hashed, so repeated runs preserve asset IDs at the cost of an extra download. Upload responses are checked for size and digest. The journal is keyed by the target name in the current spelling and its lock only serialises journal writes, so run one replication per destination at a time.
-- Original release authors and publication dates are not preserved. Discussions, permissions and Actions settings are not replicated, although Actions are disabled in the destination. Workflow files themselves are part of Git history and are copied with refs.
-
-## Release binaries
-
-Publishing a release runs `.github/workflows/release.yml`: tests, vet and vulnerability checks precede compilation/upload with `cli/gh-extension-precompile`. Release Drafter only prepares release notes. CI separately checks Linux, macOS and Windows builds for amd64 and arm64. No release is published by opening or merging a PR.
-
-## Status
-
-The project is under initial development. The first release will be v0.1.0.
+You can delete it while no replication is running; the next run downloads the history again. A per-source lock allows one run at a time: a second run fails with the lock path until the first exits. CI jobs can persist this directory between runs to avoid repeated downloads.
 
 ## License
 
 MIT
-
