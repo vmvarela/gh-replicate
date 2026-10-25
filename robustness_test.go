@@ -230,7 +230,8 @@ func TestHTTPTimeoutAndCancellation(t *testing.T) {
 
 func gitTest(t *testing.T, dir string, args ...string) string {
 	t.Helper()
-	cmd := exec.Command("git", args...)
+	// Detached auto-maintenance keeps writing into .git past the end of a test.
+	cmd := exec.Command("git", append([]string{"-c", "gc.auto=0", "-c", "maintenance.auto=false"}, args...)...)
 	cmd.Dir = dir
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -249,9 +250,15 @@ func TestLFSPointerDetection(t *testing.T) {
 	cmd := exec.Command("git", "hash-object", "-w", "--stdin")
 	cmd.Dir = dir
 	cmd.Stdin = strings.NewReader("version https://git-lfs.github.com/spec/v1\noid sha256:" + strings.Repeat("a", 64) + "\nsize 12345\n")
-	if out, err := cmd.CombinedOutput(); err != nil {
+	out, err := cmd.CombinedOutput()
+	if err != nil {
 		t.Fatal(err, string(out))
 	}
+	// Unreachable cached pointers must not prevent replication.
+	if err := r.checkLFS(dir); err != nil {
+		t.Fatal(err)
+	}
+	gitTest(t, dir, "update-ref", "refs/tags/pointer", strings.TrimSpace(string(out)))
 	if err := r.checkLFS(dir); err == nil || !strings.Contains(err.Error(), "Git LFS") {
 		t.Fatal("missing LFS detection", err)
 	}

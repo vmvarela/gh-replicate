@@ -65,11 +65,12 @@ type side struct {
 }
 
 type replicator struct {
-	source  side
-	target  side
-	ctx     context.Context
-	timeout time.Duration
-	dryRun  bool
+	cacheLock *os.File
+	source    side
+	target    side
+	ctx       context.Context
+	timeout   time.Duration
+	dryRun    bool
 }
 
 type plan struct {
@@ -323,23 +324,55 @@ func validRepo(s string) bool {
 }
 
 func (r *replicator) syncGit(source, target string) error {
-	dir, err := os.MkdirTemp("", "gh-replicate-*")
+	cacheDir, err := os.UserCacheDir()
 	if err != nil {
-		return fmt.Errorf("create temporary directory: %w", err)
+		return fmt.Errorf("locate cache directory: %w", err)
 	}
-	defer os.RemoveAll(dir)
+	dir := filepath.Join(cacheDir, "gh-replicate", "git-v1")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return fmt.Errorf("create cache directory: %w", err)
+	}
+	// Share source objects across destinations without persisting credentials.
+	key := fmt.Sprintf("%x", sha256.Sum256([]byte(gitRemote(source))))
+	gitDir := filepath.Join(dir, key+".git")
+	lock, err := lockCache(gitDir + ".lock")
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	locked := *r
+	locked.cacheLock = lock
+	r = &locked
 
-	gitDir := filepath.Join(dir, "repo.git")
-	fmt.Fprintf(os.Stderr, "  Cloning %s...\n", source)
-	if err := r.command("", r.source, "git", "clone", "--bare", gitRemote(source), gitDir); err != nil {
-		return fmt.Errorf("clone source: %w", err)
+	if err := os.MkdirAll(gitDir, 0700); err != nil {
+		return fmt.Errorf("create source cache: %w", err)
 	}
-	if err := r.command(gitDir, r.source, "git", "remote", "add", "replicate-target", gitRemote(target)); err != nil {
-		return fmt.Errorf("add destination remote: %w", err)
+	// init is idempotent, including after an interrupted first initialization.
+	// Pin SHA-1 like GitHub, so a local sha256 default cannot break the fetch.
+	if err := r.command("", r.source, "git", "init", "--bare", "--quiet", "--object-format=sha1", gitDir); err != nil {
+		return fmt.Errorf("initialize source cache: %w", err)
+	}
+	if err := r.command(gitDir, r.target, "git", "config", "--local",
+		"remote.replicate-target.url", gitRemote(target)); err != nil {
+		return fmt.Errorf("configure destination remote: %w", err)
+	}
+
+	fmt.Fprintf(os.Stderr, "  Fetching branches and tags from %s (cache: %s)...\n", source, gitDir)
+	// Prune stale source refs locally so deleted source refs are never pushed
+	// back. The destination push does not prune destination-only refs.
+	// Fetch must succeed on every run; never push a stale cache after failure.
+	// Not --atomic: a rename like release -> release/v2 cannot delete and create
+	// in one transaction, and that failure would persist in the shared cache.
+	if err := r.command(gitDir, r.source, "git", "fetch", "--prune", "--no-tags",
+		gitRemote(source),
+		"+refs/heads/*:refs/heads/*",
+		"+refs/tags/*:refs/tags/*"); err != nil {
+		return fmt.Errorf("fetch source: %w", err)
 	}
 	if err := r.checkLFS(gitDir); err != nil {
 		return err
 	}
+
 	r.disableActions(target)
 	fmt.Fprintf(os.Stderr, "  Pushing branches and tags to %s...\n", target)
 	return r.pushRefs(gitDir)
@@ -611,7 +644,7 @@ func (r *replicator) command(dir string, s side, name string, args ...string) er
 	ctx, cancel := context.WithTimeout(r.ctx, r.timeout)
 	defer cancel()
 
-	cmd := gitCommand(ctx, s.token, name, args...)
+	cmd := r.gitCommand(ctx, s.token, name, args...)
 	cmd.Dir = dir
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
