@@ -80,7 +80,7 @@ func TestUploadAsset(t *testing.T) {
 			}
 			return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
 		})}
-		err = r.uploadAsset("a/b", 123, "file +.zip", f, assetDigest("binary"))
+		_, err = r.uploadAsset("a/b", 123, "file +.zip", "file +.zip", f, assetDigest("binary"))
 		if (err == nil) != (status == 201) {
 			t.Errorf("status %d: %v", status, err)
 		}
@@ -115,7 +115,7 @@ func TestUploadAssetValidation(t *testing.T) {
 			r.target.httpClient = &http.Client{Transport: transportFunc(func(*http.Request) (*http.Response, error) {
 				return &http.Response{StatusCode: 201, Body: io.NopCloser(strings.NewReader(tc.body)), Header: make(http.Header)}, nil
 			})}
-			err = r.uploadAsset("a/b", 123, "file +.zip", f, assetDigest("binary"))
+			_, err = r.uploadAsset("a/b", 123, "file +.zip", "file +.zip", f, assetDigest("binary"))
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("wantErr=%v, got %v", tc.wantErr, err)
 			}
@@ -140,7 +140,7 @@ func TestUploadErrorBodyBounded(t *testing.T) {
 	r.target.httpClient = &http.Client{Transport: transportFunc(func(*http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: 422, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
 	})}
-	err = r.uploadAsset("a/b", 123, "file +.zip", f, assetDigest("binary"))
+	_, err = r.uploadAsset("a/b", 123, "file +.zip", "file +.zip", f, assetDigest("binary"))
 	if err == nil || !strings.Contains(err.Error(), strings.Repeat("x", 4096)) || strings.Contains(err.Error(), strings.Repeat("x", 4097)) {
 		t.Fatalf("error body was not bounded: %v", err)
 	}

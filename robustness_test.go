@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,8 +11,10 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -49,7 +52,7 @@ func fakeSide(t *testing.T, server, token string) side {
 func fakeAPI(t *testing.T, handler http.HandlerFunc) *replicator {
 	t.Helper()
 	s := fakeSide(t, fakeServer(t, handler), "test-token")
-	return &replicator{source: s, target: s, ctx: context.Background(), timeout: time.Minute}
+	return &replicator{source: s, target: s, ctx: context.Background(), timeout: time.Minute, cacheDir: t.TempDir()}
 }
 
 func captureStderr(t *testing.T, fn func()) string {
@@ -380,31 +383,489 @@ func TestMissingDigestsPreserveAsset(t *testing.T) {
 	}
 }
 
-func TestSameSizeDifferentContentReplacesAsset(t *testing.T) {
-	var methods []string
-	r := fakeAPI(t, func(w http.ResponseWriter, req *http.Request) {
-		methods = append(methods, req.Method+" "+req.URL.Path)
-		switch req.Method + " " + req.URL.Path {
-		case "GET /source":
-			fmt.Fprint(w, "abc")
-		case "GET /dest":
-			fmt.Fprint(w, "xyz")
-		case "DELETE /repos/a/b/releases/assets/2":
-			fmt.Fprint(w, "{}")
-		case "POST /repos/a/b/releases/1/assets":
-			fmt.Fprintf(w, `{"size":3,"digest":%q}`, assetDigest("abc"))
-		default:
-			t.Errorf("unexpected request: %s %s", req.Method, req.URL.Path)
+// inventory is a stateful destination: a failing attempt and the recovery
+// attempt then operate on the assets the first one actually left behind.
+type inventory struct {
+	t          *testing.T
+	assets     []*invAsset
+	nextID     int64
+	log        []string
+	fail       map[string]string
+	omitDigest bool
+	source     string
+	cacheDir   string
+}
+
+type invAsset struct {
+	id    int64
+	name  string
+	body  string
+	state string
+}
+
+func newInventory(t *testing.T, assets ...invAsset) *inventory {
+	t.Helper()
+	inv := &inventory{t: t, nextID: 10, fail: map[string]string{}, source: "abc", cacheDir: t.TempDir()}
+	for _, a := range assets {
+		a := a
+		inv.assets = append(inv.assets, &a)
+	}
+	return inv
+}
+
+// replicator shares the inventory's cache directory, so a second run sees the
+// journal the first one wrote.
+func (inv *inventory) replicator() *replicator {
+	r := fakeAPI(inv.t, inv.serve)
+	r.cacheDir = inv.cacheDir
+	return r
+}
+
+func (inv *inventory) find(name string) *invAsset {
+	for _, a := range inv.assets {
+		if a.name == name {
+			return a
 		}
-	})
-	src := release{Assets: []asset{{Name: "binary", Size: 3, URL: "https://api.github.com/source"}}}
-	dst := release{ID: 1, Assets: []asset{{ID: 2, Name: "binary", Size: 3, URL: "https://api.github.com/dest"}}}
-	if err := r.syncAssets("a/b", src, dst); err != nil {
+	}
+	return nil
+}
+
+func (inv *inventory) byID(id int64) *invAsset {
+	for _, a := range inv.assets {
+		if a.id == id {
+			return a
+		}
+	}
+	return nil
+}
+
+func (inv *inventory) body(name string) (string, bool) {
+	a := inv.find(name)
+	if a == nil {
+		return "", false
+	}
+	return a.body, true
+}
+
+// take consumes a one-shot injected failure for the given transition.
+func (inv *inventory) take(op string) string {
+	mode := inv.fail[op]
+	delete(inv.fail, op)
+	return mode
+}
+
+func (inv *inventory) release() release {
+	out := release{ID: 1}
+	for _, a := range inv.assets {
+		entry := asset{
+			ID: a.id, Name: a.name, Size: int64(len(a.body)), State: a.state,
+			URL: fmt.Sprintf("https://api.github.com/dest/%d", a.id),
+		}
+		if !inv.omitDigest {
+			entry.Digest = assetDigest(a.body)
+		}
+		out.Assets = append(out.Assets, entry)
+	}
+	return out
+}
+
+func (inv *inventory) assetJSON(a *invAsset) map[string]any {
+	entry := map[string]any{
+		"id": a.id, "name": a.name, "size": len(a.body), "state": a.state,
+		"url": fmt.Sprintf("https://api.github.com/dest/%d", a.id),
+	}
+	if !inv.omitDigest {
+		entry["digest"] = assetDigest(a.body)
+	}
+	return entry
+}
+
+func (inv *inventory) serve(w http.ResponseWriter, req *http.Request) {
+	inv.t.Helper()
+	const assetsPath = "/repos/a/b/releases/1/assets"
+	switch {
+	case req.Method == http.MethodGet && req.URL.Path == "/source":
+		fmt.Fprint(w, inv.source)
+	case req.Method == http.MethodGet && strings.HasPrefix(req.URL.Path, "/dest/"):
+		inv.log = append(inv.log, "GET "+req.URL.Path)
+		id, err := strconv.ParseInt(strings.TrimPrefix(req.URL.Path, "/dest/"), 10, 64)
+		if err != nil {
+			inv.t.Fatal(err)
+		}
+		a := inv.byID(id)
+		if a == nil {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		fmt.Fprint(w, a.body)
+	case req.Method == http.MethodGet && req.URL.Path == assetsPath:
+		inv.log = append(inv.log, "GET assets")
+		list := []map[string]any{}
+		for _, a := range inv.assets {
+			list = append(list, inv.assetJSON(a))
+		}
+		if err := json.NewEncoder(w).Encode(list); err != nil {
+			inv.t.Fatal(err)
+		}
+	case req.Method == http.MethodPost && req.URL.Path == assetsPath:
+		name := req.URL.Query().Get("name")
+		inv.log = append(inv.log, "POST "+name)
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			inv.t.Fatal(err)
+		}
+		mode := inv.take("upload")
+		if mode == "fail" {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		inv.nextID++
+		a := &invAsset{id: inv.nextID, name: name, body: string(body), state: "uploaded"}
+		if mode == "starter" {
+			a.body, a.state = "", "starter"
+		}
+		inv.assets = append(inv.assets, a)
+		if mode == "lost" {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		if err := json.NewEncoder(w).Encode(inv.assetJSON(a)); err != nil {
+			inv.t.Fatal(err)
+		}
+	case req.Method == http.MethodPatch && strings.HasPrefix(req.URL.Path, "/repos/a/b/releases/assets/"):
+		id, err := strconv.ParseInt(path.Base(req.URL.Path), 10, 64)
+		if err != nil {
+			inv.t.Fatal(err)
+		}
+		var body struct {
+			Name string `json:"name"`
+		}
+		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+			inv.t.Fatal(err)
+		}
+		inv.log = append(inv.log, fmt.Sprintf("PATCH %d => %s", id, body.Name))
+		mode := inv.take("rename")
+		if mode == "fail" {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		a := inv.byID(id)
+		if a == nil {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if other := inv.find(body.Name); other != nil && other.id != id {
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			fmt.Fprint(w, `{"message":"already_exists"}`)
+			return
+		}
+		a.name = body.Name
+		if mode == "lost" {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		fmt.Fprint(w, "{}")
+	case req.Method == http.MethodDelete && strings.HasPrefix(req.URL.Path, "/repos/a/b/releases/assets/"):
+		id, err := strconv.ParseInt(path.Base(req.URL.Path), 10, 64)
+		if err != nil {
+			inv.t.Fatal(err)
+		}
+		inv.log = append(inv.log, fmt.Sprintf("DELETE %d", id))
+		mode := inv.take("delete")
+		if mode == "fail" {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		for i, a := range inv.assets {
+			if a.id == id {
+				inv.assets = append(inv.assets[:i], inv.assets[i+1:]...)
+				break
+			}
+		}
+		if mode == "lost" {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		fmt.Fprint(w, "{}")
+	default:
+		inv.t.Errorf("unexpected request: %s %s", req.Method, req.URL)
+		w.WriteHeader(http.StatusNotImplemented)
+	}
+}
+
+const sourceBinary = "https://api.github.com/source"
+
+func binarySource() release { return binarySourceBytes("abc") }
+
+func binarySourceBytes(body string) release {
+	return release{Assets: []asset{{Name: "binary", Size: int64(len(body)), Digest: assetDigest(body), URL: sourceBinary}}}
+}
+
+// requireOnlyAsset checks the release ended with exactly one asset of the given
+// name and body.
+func requireOnlyAsset(t *testing.T, inv *inventory, name, body string) {
+	t.Helper()
+	if len(inv.assets) != 1 {
+		t.Fatalf("assets %+v, want only %q", inv.assets, name)
+	}
+	if got, ok := inv.body(name); !ok || got != body {
+		t.Fatalf("asset %q body %q present=%v, want %q", name, got, ok, body)
+	}
+}
+
+func TestReplacementStagesBeforeDeleting(t *testing.T) {
+	inv := newInventory(t, invAsset{id: 1, name: "binary", body: "xyz"})
+	r := inv.replicator()
+	if err := r.syncAssets("a/b", binarySource(), inv.release()); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"GET /source", "GET /dest", "DELETE /repos/a/b/releases/assets/2", "POST /repos/a/b/releases/1/assets"}
-	if !reflect.DeepEqual(methods, want) {
-		t.Fatalf("requests %v, want %v", methods, want)
+	if len(inv.log) != 3 || !strings.HasPrefix(inv.log[0], "POST binary"+stagedSuffix) ||
+		inv.log[1] != "DELETE 1" || !strings.HasSuffix(inv.log[2], "=> binary") {
+		t.Fatalf("requests %v, want a staged upload, then the delete, then the rename", inv.log)
+	}
+	requireOnlyAsset(t, inv, "binary", "abc")
+	j, err := openJournal(inv.cacheDir, "a/b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := j.get(1, "binary"); ok {
+		t.Fatal("journal entry survived a successful replacement")
+	}
+	j.Close()
+
+	// The journal entry is gone, so a rerun writes nothing.
+	inv.log = nil
+	if err := inv.replicator().syncAssets("a/b", binarySource(), inv.release()); err != nil {
+		t.Fatal(err)
+	}
+	if len(inv.log) != 0 {
+		t.Fatalf("rerun wrote again: %v", inv.log)
+	}
+}
+
+func TestFailedUploadKeepsPreviousAsset(t *testing.T) {
+	inv := newInventory(t, invAsset{id: 1, name: "binary", body: "xyz"})
+	inv.fail["upload"] = "fail"
+	err := inv.replicator().syncAssets("a/b", binarySource(), inv.release())
+	if err == nil || !strings.Contains(err.Error(), "upload outcome is unknown") {
+		t.Fatalf("expected an unresolved upload error, got %v", err)
+	}
+	if body, ok := inv.body("binary"); !ok || body != "xyz" {
+		t.Fatalf("previous asset body %q present=%v, want it preserved", body, ok)
+	}
+	if len(inv.assets) != 1 {
+		t.Fatalf("assets %+v, want only the previous asset", inv.assets)
+	}
+}
+
+// A starter left by an interrupted upload is not the only copy, but the tool
+// no longer deletes it: an orphan is safer than a wrong deletion.
+func TestStarterUploadIsLeftAndRerunSucceeds(t *testing.T) {
+	inv := newInventory(t, invAsset{id: 1, name: "binary", body: "xyz"})
+	inv.fail["upload"] = "starter"
+	if err := inv.replicator().syncAssets("a/b", binarySource(), inv.release()); err == nil {
+		t.Fatal("expected the interrupted upload to fail")
+	}
+	if len(inv.assets) != 2 || inv.assets[1].state != "starter" {
+		t.Fatalf("assets %+v, want the previous one plus an empty starter", inv.assets)
+	}
+
+	// The second run must never delete the only full copy before the new one is
+	// verified; the starter simply stays behind.
+	if err := inv.replicator().syncAssets("a/b", binarySource(), inv.release()); err != nil {
+		t.Fatal(err)
+	}
+	if body, ok := inv.body("binary"); !ok || body != "abc" {
+		t.Fatalf("canonical body %q present=%v, want the new bytes", body, ok)
+	}
+	var starters int
+	for _, a := range inv.assets {
+		if a.state == "starter" {
+			starters++
+		}
+	}
+	if len(inv.assets) != 2 || starters != 1 {
+		t.Fatalf("assets %+v, want the canonical plus the orphaned starter", inv.assets)
+	}
+}
+
+func TestLostUploadResponseIsReconciled(t *testing.T) {
+	inv := newInventory(t, invAsset{id: 1, name: "binary", body: "xyz"})
+	inv.fail["upload"] = "lost"
+	if err := inv.replicator().syncAssets("a/b", binarySource(), inv.release()); err != nil {
+		t.Fatal(err)
+	}
+	requireOnlyAsset(t, inv, "binary", "abc")
+}
+
+func TestRenameFailureRecoversOnRerun(t *testing.T) {
+	inv := newInventory(t, invAsset{id: 1, name: "binary", body: "xyz"})
+	inv.fail["rename"] = "fail"
+	err := inv.replicator().syncAssets("a/b", binarySource(), inv.release())
+	if err == nil || !strings.Contains(err.Error(), "rename failed") {
+		t.Fatalf("expected a rename error, got %v", err)
+	}
+	if len(inv.assets) != 1 || inv.assets[0].body != "abc" || !strings.HasPrefix(inv.assets[0].name, "binary"+stagedSuffix) {
+		t.Fatalf("assets %+v, want only the verified staged copy", inv.assets)
+	}
+
+	if err := inv.replicator().syncAssets("a/b", binarySource(), inv.release()); err != nil {
+		t.Fatal(err)
+	}
+	requireOnlyAsset(t, inv, "binary", "abc")
+}
+
+// When the source asset changes between runs, the staged copy no longer
+// verifies against the new digest. It may be the only full copy, so it stays.
+func TestStagedCopyIsKeptWhenTheSourceChanges(t *testing.T) {
+	inv := newInventory(t, invAsset{id: 1, name: "binary", body: "xyz"})
+	inv.fail["rename"] = "fail"
+	if err := inv.replicator().syncAssets("a/b", binarySource(), inv.release()); err == nil {
+		t.Fatal("expected the rename to fail")
+	}
+	if len(inv.assets) != 1 || inv.assets[0].body != "abc" {
+		t.Fatalf("assets %+v, want only the staged copy", inv.assets)
+	}
+
+	inv.source = "abd"
+	if err := inv.replicator().syncAssets("a/b", binarySourceBytes("abd"), inv.release()); err != nil {
+		t.Fatal(err)
+	}
+	if body, ok := inv.body("binary"); !ok || body != "abd" {
+		t.Fatalf("canonical body %q present=%v, want the new bytes", body, ok)
+	}
+	var kept int
+	for _, a := range inv.assets {
+		if a.body == "abc" && strings.HasPrefix(a.name, "binary"+stagedSuffix) {
+			kept++
+		}
+	}
+	if kept != 1 {
+		t.Fatalf("assets %+v, want the earlier staged copy preserved", inv.assets)
+	}
+}
+
+func TestRenameAppliedWithLostResponse(t *testing.T) {
+	inv := newInventory(t, invAsset{id: 1, name: "binary", body: "xyz"})
+	inv.fail["rename"] = "lost"
+	err := inv.replicator().syncAssets("a/b", binarySource(), inv.release())
+	if err == nil || !strings.Contains(err.Error(), "may have been applied") {
+		t.Fatalf("expected an ambiguous rename error, got %v", err)
+	}
+	requireOnlyAsset(t, inv, "binary", "abc")
+
+	if err := inv.replicator().syncAssets("a/b", binarySource(), inv.release()); err != nil {
+		t.Fatal(err)
+	}
+	requireOnlyAsset(t, inv, "binary", "abc")
+}
+
+func TestDeleteFailureRecoversOnRerun(t *testing.T) {
+	inv := newInventory(t, invAsset{id: 1, name: "binary", body: "xyz"})
+	inv.fail["delete"] = "fail"
+	err := inv.replicator().syncAssets("a/b", binarySource(), inv.release())
+	if err == nil || !strings.Contains(err.Error(), "may or may not still exist") {
+		t.Fatalf("expected a delete error, got %v", err)
+	}
+	if body, ok := inv.body("binary"); !ok || body != "xyz" {
+		t.Fatalf("previous asset lost: %q present=%v", body, ok)
+	}
+
+	if err := inv.replicator().syncAssets("a/b", binarySource(), inv.release()); err != nil {
+		t.Fatal(err)
+	}
+	requireOnlyAsset(t, inv, "binary", "abc")
+}
+
+func TestDeleteAppliedWithLostResponse(t *testing.T) {
+	inv := newInventory(t, invAsset{id: 1, name: "binary", body: "xyz"})
+	inv.fail["delete"] = "lost"
+	if err := inv.replicator().syncAssets("a/b", binarySource(), inv.release()); err == nil {
+		t.Fatal("expected the lost delete response to fail the run")
+	}
+	if len(inv.assets) != 1 || inv.assets[0].body != "abc" {
+		t.Fatalf("assets %+v, want only the staged copy", inv.assets)
+	}
+
+	if err := inv.replicator().syncAssets("a/b", binarySource(), inv.release()); err != nil {
+		t.Fatal(err)
+	}
+	requireOnlyAsset(t, inv, "binary", "abc")
+}
+
+func TestNoDigestUploadIsVerifiedByDownload(t *testing.T) {
+	inv := newInventory(t, invAsset{id: 1, name: "binary", body: "xyz"})
+	inv.omitDigest = true
+	if err := inv.replicator().syncAssets("a/b", binarySource(), inv.release()); err != nil {
+		t.Fatal(err)
+	}
+	requireOnlyAsset(t, inv, "binary", "abc")
+}
+
+func TestUnjournaledStagedLookingAssetIsNotTouched(t *testing.T) {
+	foreign := "binary" + stagedSuffix + "deadbeef"
+	inv := newInventory(t,
+		invAsset{id: 1, name: "binary", body: "xyz"},
+		invAsset{id: 2, name: foreign, body: "abc"},
+	)
+	if err := inv.replicator().syncAssets("a/b", binarySource(), inv.release()); err != nil {
+		t.Fatal(err)
+	}
+	if body, ok := inv.body(foreign); !ok || body != "abc" {
+		t.Fatalf("staged-looking asset body %q present=%v, want it untouched", body, ok)
+	}
+	if body, ok := inv.body("binary"); !ok || body != "abc" {
+		t.Fatalf("canonical body %q present=%v, want the new bytes", body, ok)
+	}
+}
+
+func TestEmptyUserAssetIsNotDeleted(t *testing.T) {
+	inv := newInventory(t,
+		invAsset{id: 1, name: "binary", body: "xyz"},
+		invAsset{id: 2, name: "notes", state: "uploaded"},
+	)
+	if err := inv.replicator().syncAssets("a/b", binarySource(), inv.release()); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := inv.body("notes"); !ok {
+		t.Fatal("empty destination-only asset was deleted")
+	}
+}
+
+func TestDestinationOnlyAssetSurvivesReplacement(t *testing.T) {
+	inv := newInventory(t,
+		invAsset{id: 1, name: "binary", body: "xyz"},
+		invAsset{id: 2, name: "user-file", body: "keep"},
+	)
+	if err := inv.replicator().syncAssets("a/b", binarySource(), inv.release()); err != nil {
+		t.Fatal(err)
+	}
+	if body, ok := inv.body("user-file"); !ok || body != "keep" {
+		t.Fatalf("destination-only asset body %q present=%v, want it preserved", body, ok)
+	}
+}
+
+// A journal that cannot be parsed must stop the run rather than guess which
+// staged assets are ours.
+func TestCorruptJournalStopsReplacement(t *testing.T) {
+	inv := newInventory(t, invAsset{id: 1, name: "binary", body: "xyz"})
+	dir := filepath.Join(inv.cacheDir, "gh-replicate", "staged-v1")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	name := fmt.Sprintf("%x.json", sha256.Sum256([]byte("a/b")))
+	if err := os.WriteFile(filepath.Join(dir, name), []byte("{"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	err := inv.replicator().syncAssets("a/b", binarySource(), inv.release())
+	if err == nil || !strings.Contains(err.Error(), "parse journal") {
+		t.Fatalf("expected a journal parse error, got %v", err)
+	}
+	if body, ok := inv.body("binary"); !ok || body != "xyz" {
+		t.Fatalf("previous asset body %q present=%v, want it untouched", body, ok)
+	}
+	if len(inv.log) != 0 {
+		t.Fatalf("wrote before failing: %v", inv.log)
 	}
 }
 
