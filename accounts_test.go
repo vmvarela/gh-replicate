@@ -125,7 +125,7 @@ func accountServer(t *testing.T, logins map[string]string, paths *[]string) stri
 		case strings.HasSuffix(req.URL.Path, "/releases"):
 			fmt.Fprint(w, `[]`)
 		case strings.HasPrefix(req.URL.Path, "/repos/"):
-			fmt.Fprint(w, `{"description":"","homepage":""}`)
+			fmt.Fprintf(w, `{"id":%d,"description":"","homepage":""}`, testRepoID(strings.TrimPrefix(req.URL.Path, "/repos/")))
 		default:
 			t.Errorf("unexpected request: %s %s", req.Method, req.URL.Path)
 		}
