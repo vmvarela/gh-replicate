@@ -508,3 +508,151 @@ func TestSyncMetadataSetsDestinationDefaultBranch(t *testing.T) {
 		t.Fatalf("default_branch = %q, want master", body["default_branch"])
 	}
 }
+
+// componentServer serves a source with releases v1 (also in the destination,
+// so it is updated and Latest) and v2 (created), and records destination writes.
+func componentServer(t *testing.T, isTarget bool, labelSet []label, writes *[]string) string {
+	t.Helper()
+	return fakeServer(t, func(w http.ResponseWriter, req *http.Request) {
+		body, _ := io.ReadAll(req.Body)
+		if req.Method != http.MethodGet {
+			*writes = append(*writes, req.Method+" "+req.URL.Path+" "+string(body))
+			if req.Method == http.MethodPatch && strings.HasSuffix(req.URL.Path, "/labels/bug") {
+				w.WriteHeader(http.StatusNotFound)
+				fmt.Fprint(w, `{"message":"Not Found"}`)
+				return
+			}
+			fmt.Fprint(w, `{"id":12}`)
+			return
+		}
+		p := req.URL.Path
+		switch {
+		case p == "/user":
+			fmt.Fprint(w, `{"login":"user"}`)
+		case strings.HasSuffix(p, "/actions/permissions"):
+			fmt.Fprint(w, `{"enabled":true}`)
+		case strings.HasSuffix(p, "/topics"):
+			fmt.Fprint(w, `{"names":[]}`)
+		case strings.HasSuffix(p, "/labels"):
+			_ = json.NewEncoder(w).Encode(labelSet)
+		case strings.HasSuffix(p, "/releases/latest"):
+			fmt.Fprint(w, `{"id":1,"tag_name":"v1"}`)
+		case strings.HasSuffix(p, "/releases") && isTarget:
+			fmt.Fprint(w, `[{"id":11,"tag_name":"v1"}]`)
+		case strings.HasSuffix(p, "/releases"):
+			fmt.Fprint(w, `[{"id":1,"tag_name":"v1","name":"one"},{"id":2,"tag_name":"v2","name":"two"}]`)
+		case strings.HasPrefix(p, "/repos/"):
+			fmt.Fprintf(w, `{"id":%d,"description":"d","default_branch":"main"}`, testRepoID(strings.TrimPrefix(p, "/repos/")))
+		default:
+			t.Errorf("unexpected request: %s %s", req.Method, p)
+		}
+	})
+}
+
+func TestRunComponentsSelection(t *testing.T) {
+	t.Setenv("GH_HOST", "github.com")
+	names := []string{"refs", "metadata", "labels", "releases"}
+	// Every non-empty subset (bitmask) plus the default (all four).
+	var lists []string
+	for mask := 1; mask < 16; mask++ {
+		var sel []string
+		for i, n := range names {
+			if mask&(1<<i) != 0 {
+				sel = append(sel, n)
+			}
+		}
+		lists = append(lists, strings.Join(sel, ","))
+	}
+	lists = append(lists, "", "\x00empty") // flag omitted, flag given as ''
+	for _, list := range lists {
+		explicitEmpty := list == "\x00empty"
+		if explicitEmpty {
+			list = ""
+		}
+		has := func(n string) bool { return list == "" || strings.Contains(","+list+",", ","+n+",") }
+		args := []string{}
+		if list != "" || explicitEmpty {
+			args = append(args, "--components", list)
+		}
+		args = append(args, sourceRepo, targetRepo)
+		if !has("refs") && has("releases") {
+			// Rejected before any I/O: no credentials resolved, no API call.
+			seamStub(t)
+			calls := 0
+			newSide = func(string, string, time.Duration) (side, error) { calls++; return side{}, nil }
+			if err := run(args); err == nil || !strings.Contains(err.Error(), "requires refs") || calls != 0 {
+				t.Fatalf("%s: err=%v calls=%d, want rejection before I/O", list, err, calls)
+			}
+			continue
+		}
+		var sel, skip []string
+		for _, n := range names {
+			if has(n) {
+				sel = append(sel, n)
+			} else {
+				skip = append(skip, n)
+			}
+		}
+		skipped := "none"
+		if len(skip) > 0 {
+			skipped = strings.Join(skip, ",")
+		}
+		report := "Components selected: " + strings.Join(sel, ",") + "; skipped: " + skipped + "\n"
+
+		for _, dry := range []bool{true, false} {
+			f := newGitFixture(t)
+			var srcWrites, dstWrites []string
+			labels := []label{{Name: "bug", Color: "d73a4a"}}
+			sourceURL := componentServer(t, false, labels, &srcWrites)
+			targetURL := componentServer(t, true, nil, &dstWrites)
+			stubRun(t, sourceURL, targetURL, f)
+			a := args
+			if dry {
+				a = append([]string{"--dry-run"}, args...)
+			}
+			out := captureStderr(t, func() {
+				if err := run(a); err != nil {
+					t.Errorf("%s dry=%v: %v", list, dry, err)
+				}
+			})
+			if !strings.Contains(out, report) {
+				t.Fatalf("%s dry=%v: want %q in %q", list, dry, report, out)
+			}
+			if has("refs") != strings.Contains(out, "matching refs will be overwritten in the target") {
+				t.Fatalf("%s dry=%v: overwrite warning mismatch: %q", list, dry, out)
+			}
+			if len(srcWrites) != 0 {
+				t.Fatalf("%s: source written: %q", list, srcWrites)
+			}
+			pushed := gitRefs(t, f.destination) != ""
+			if dry {
+				if pushed || len(dstWrites) != 0 {
+					t.Fatalf("%s: dry run wrote refs=%v requests=%q", list, pushed, dstWrites)
+				}
+				if has("releases") != strings.Contains(out, "Would POST repos/"+targetRepo+"/releases") {
+					t.Fatalf("%s: dry-run release report mismatch: %q", list, out)
+				}
+				continue
+			}
+			all := strings.Join(dstWrites, "\n")
+			effects := map[string]bool{
+				"refs":     pushed,
+				"metadata": strings.Contains(all, "PATCH /repos/"+targetRepo+" ") && strings.Contains(all, "PUT /repos/"+targetRepo+"/topics "),
+				"labels":   strings.Contains(all, "POST /repos/"+targetRepo+"/labels "),
+				"releases": strings.Contains(all, "POST /repos/"+targetRepo+"/releases {") && strings.Contains(all, `"tag_name":"v2"`) &&
+					strings.Contains(all, "PATCH /repos/"+targetRepo+"/releases/11 {") && strings.Contains(all, `"make_latest":"true"`),
+			}
+			for _, n := range names {
+				if effects[n] != has(n) {
+					t.Fatalf("%s: effect %s = %v, want %v; writes:\n%s", list, n, effects[n], has(n), all)
+				}
+			}
+			if has("refs") != strings.Contains(all, "PUT /repos/"+targetRepo+"/actions/permissions ") {
+				t.Fatalf("%s: Actions disabling must happen exactly with refs:\n%s", list, all)
+			}
+			if has("refs") && gitRefs(t, f.destination) != gitRefs(t, f.source) {
+				t.Fatalf("%s: refs differ", list)
+			}
+		}
+	}
+}

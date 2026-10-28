@@ -77,6 +77,54 @@ type replicator struct {
 	dryRun    bool
 }
 
+// components selects what a run replicates; releases need refs because
+// release tags must exist in the destination.
+type components struct{ refs, metadata, labels, releases bool }
+
+func parseComponents(v string) (components, error) {
+	var c components
+	if strings.TrimSpace(v) == "" {
+		return components{true, true, true, true}, nil
+	}
+	for _, name := range strings.Split(v, ",") {
+		switch strings.TrimSpace(name) {
+		case "refs":
+			c.refs = true
+		case "metadata":
+			c.metadata = true
+		case "labels":
+			c.labels = true
+		case "releases":
+			c.releases = true
+		default:
+			return c, fmt.Errorf("unknown component %q; use refs, metadata, labels or releases", name)
+		}
+	}
+	if c.releases && !c.refs {
+		return c, errors.New("component releases requires refs")
+	}
+	return c, nil
+}
+
+func (c components) String() string {
+	var sel, omit []string
+	for _, e := range []struct {
+		n  string
+		on bool
+	}{{"refs", c.refs}, {"metadata", c.metadata}, {"labels", c.labels}, {"releases", c.releases}} {
+		if e.on {
+			sel = append(sel, e.n)
+		} else {
+			omit = append(omit, e.n)
+		}
+	}
+	o := "none"
+	if len(omit) > 0 {
+		o = strings.Join(omit, ",")
+	}
+	return "selected: " + strings.Join(sel, ",") + "; skipped: " + o
+}
+
 type plan struct {
 	repository     repository
 	topics         []string
@@ -98,6 +146,7 @@ func run(args []string) error {
 	timeout := flags.Duration("timeout", 30*time.Minute, "timeout per Git command or HTTP request")
 	sourceAccount := flags.String("source-account", "", "authenticated gh account login used to read the source")
 	targetAccount := flags.String("target-account", "", "authenticated gh account login used to write the destination")
+	selected := flags.String("components", "refs,metadata,labels,releases", "comma-separated components to replicate: refs, metadata, labels, releases")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
@@ -105,10 +154,14 @@ func run(args []string) error {
 		return err
 	}
 	if flags.NArg() != 2 {
-		return errors.New("usage: gh replicate [--dry-run] [--timeout 30m] [--source-account LOGIN] [--target-account LOGIN] SOURCE TARGET")
+		return errors.New("usage: gh replicate [--dry-run] [--components LIST] [--timeout 30m] [--source-account LOGIN] [--target-account LOGIN] SOURCE TARGET")
 	}
 	if *timeout <= 0 {
 		return errors.New("timeout must be positive")
+	}
+	comp, err := parseComponents(*selected)
+	if err != nil {
+		return err
 	}
 	source, target := flags.Arg(0), flags.Arg(1)
 	if !validRepo(source) || !validRepo(target) {
@@ -132,19 +185,36 @@ func run(args []string) error {
 		return err
 	}
 	r := &replicator{source: src, target: dst, ctx: ctx, timeout: *timeout, dryRun: *dryRun}
-	fmt.Fprintf(os.Stderr, "Source: %s -> Target: %s (matching refs will be overwritten)\n", source, target)
+	fmt.Fprintf(os.Stderr, "Source: %s -> Target: %s\nComponents %s\n", source, target, comp)
+	if comp.refs {
+		fmt.Fprintln(os.Stderr, "Warning: matching refs will be overwritten in the target.")
+	}
+	if comp.metadata && !comp.refs {
+		fmt.Fprintln(os.Stderr, "Warning: metadata sets the source default branch without refs; it fails if the destination lacks that branch.")
+	}
 	p, err := r.preflight(source, target)
 	if err != nil {
 		return err
 	}
-	if err := r.syncGit(source, target); err != nil {
-		return err
+	if comp.refs {
+		if err := r.syncGit(source, target); err != nil {
+			return err
+		}
 	}
-	if err := r.syncMetadata(target, p); err != nil {
-		return err
+	if comp.metadata {
+		if err := r.syncMetadata(target, p); err != nil {
+			return err
+		}
 	}
-	if err := r.syncReleases(target, p); err != nil {
-		return err
+	if comp.labels {
+		if err := r.syncLabels(target, p); err != nil {
+			return err
+		}
+	}
+	if comp.releases {
+		if err := r.syncReleases(target, p); err != nil {
+			return err
+		}
 	}
 	if r.dryRun {
 		fmt.Fprintln(os.Stderr, "Dry run complete; no destination changes made.")
@@ -414,6 +484,10 @@ func (r *replicator) syncMetadata(target string, p *plan) error {
 	if err := r.call(r.target, "PUT", "repos/"+target+"/topics", jsonBody(map[string]any{"names": p.topics}), nil); err != nil {
 		return fmt.Errorf("update topics: %w", err)
 	}
+	return nil
+}
+
+func (r *replicator) syncLabels(target string, p *plan) error {
 	for _, l := range p.labels {
 		path := "repos/" + target + "/labels/" + url.PathEscape(l.Name)
 		if r.dryRun {

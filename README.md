@@ -45,7 +45,7 @@ gh extension install .
 ## Use
 
 ```sh
-gh replicate [--dry-run] [--timeout 30m] [--source-account LOGIN] [--target-account LOGIN] SOURCE TARGET
+gh replicate [--dry-run] [--components LIST] [--timeout 30m] [--source-account LOGIN] [--target-account LOGIN] SOURCE TARGET
 ```
 
 Both repositories use `OWNER/REPO`. Start with a dry run, which reads the source and reports what it would change without writing to the destination:
@@ -55,9 +55,17 @@ gh replicate --dry-run vmvarela/project vmvarela/project-replica
 gh replicate vmvarela/project vmvarela/project-replica
 ```
 
-A real run disables the destination's GitHub Actions before pushing, so a push cannot start workflows from the copied files, and then sets the destination default branch to the source's. It reports both changes when they happen; already running workflows are not cancelled.
+A real run with `refs` selected (the default) attempts to disable the destination's GitHub Actions before pushing. If that fails, it warns and continues, so the push may start workflows; already running workflows are not cancelled. With `metadata` selected it also sets the destination default branch to the source's. Without `refs`, Actions are never touched.
 
 Running the command again is normal and safe. Matching refs are force-pushed as one atomic update, unchanged release assets are detected by digest and skipped, and content that exists only in the destination is preserved. Git refs, metadata and releases are not one global transaction, so a failure partway through can leave some metadata unsynchronised; run the command again to finish.
+
+### Choosing components
+
+`--components` takes a comma-separated list of `refs`, `metadata` (description, homepage, topics and default branch), `labels` and `releases`; the default, also used for an empty `--components ''`, is all four. Dry runs and real runs print which are selected and which are skipped. `releases` requires `refs` (release tags must exist in the destination) and is rejected before any write otherwise. Actions are only touched when `refs` is selected, and the default branch is changed only with `metadata`. Preflight still reads every component, so unreadable data can stop a run even if skipped. `metadata` without `refs` fails if the destination lacks the source default branch.
+
+```sh
+gh replicate --components labels,metadata owner/src owner/dst
+```
 
 ### Replicating between two accounts
 
@@ -74,7 +82,7 @@ Both flags are optional and independent; without them the active account is used
 
 - **Check the direction.** Source wins for matching refs. A dry run reports what would change; it does not guarantee that server-side protections will accept the push.
 - **Ref renames can be blocked.** Replacing `release` with `release/v2` fails while `release` still exists in the destination, because destination-only refs are never deleted. Delete or rename it, then rerun.
-- **Git LFS content is not copied.** A repository that uses LFS stops before any destination change, including for pointers in its history.
+- **Git LFS content is not copied.** A repository that uses LFS stops before any destination change when `refs` is selected, including for pointers in its history; without `refs` no Git history is read, so this check does not run.
 - **Some assets need a second step.** A changed release asset is uploaded under a temporary name, verified, then swapped in, so its name is briefly missing. An interrupted run leaves either the previous asset or the verified replacement; a rerun finishes the work, and a leftover temporary asset may need deleting from the release.
 - **Invalid input stops the run before any write.** More than 20 topics, an empty release tag or a duplicated release tag, including drafts, abort the replication. Releases are matched by tag.
 - **Retries are bounded.** Read requests retry twice for selected transient failures and short rate limits; write requests are never replayed automatically, so rerun instead.
