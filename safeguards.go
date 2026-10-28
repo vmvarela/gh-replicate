@@ -53,7 +53,7 @@ func gitCommand(ctx context.Context, token, name string, args ...string) *exec.C
 	if name == "git" {
 		args = append([]string{"-c", "credential.helper=", "-c", "credential.https://github.com.helper=!gh auth git-credential", "-c", "http.https://github.com/.extraheader="}, args...)
 	}
-	cmd := exec.CommandContext(ctx, name, args...)
+	cmd := exec.CommandContext(ctx, name, args...) // #nosec G204 -- all production callers pass the literal "git"; args go directly to argv with no shell
 	cmd.Env = gitEnv(token)
 	return cmd
 }
@@ -77,7 +77,7 @@ func gitEnv(token string) []string {
 // tokenForAccount reads a token the user already stored for that account; it
 // never switches the active account or writes the credential store.
 var tokenForAccount = func(login string) (string, error) {
-	out, err := exec.Command("gh", "auth", "token", "--hostname", "github.com", "--user", login).Output()
+	out, err := exec.Command("gh", "auth", "token", "--hostname", "github.com", "--user", login).Output() // #nosec G204 -- fixed "gh" binary; the --source-account/--target-account value is one argv element after --user, with no shell
 	if err != nil {
 		var exit *exec.ExitError
 		if errors.As(err, &exit) && len(bytes.TrimSpace(exit.Stderr)) > 0 {
