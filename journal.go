@@ -40,26 +40,26 @@ func openJournal(cacheDir, target string) (*assetJournal, error) {
 		return nil, fmt.Errorf("cannot lock journal %s (another replication may be running): %w", path, err)
 	}
 	j := &assetJournal{path: path, entries: map[string]journalEntry{}, lock: lock}
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) // #nosec G304 -- cacheDir comes from the caller or os.UserCacheDir; the file name is a SHA-256 hex of target, so target cannot add path segments
 	switch {
 	case errors.Is(err, os.ErrNotExist):
 	case err != nil:
-		lock.Close()
+		lock.Close() // #nosec G104 -- cleanup on error path; the original error is returned
 		return nil, fmt.Errorf("read journal: %w", err)
 	default:
 		// Only a missing file means "no entries yet"; anything unreadable must
 		// stop the run rather than silently forget which assets are ours.
 		if err := json.Unmarshal(data, &j.entries); err != nil {
-			lock.Close()
+			lock.Close() // #nosec G104 -- cleanup on error path; the original error is returned
 			return nil, fmt.Errorf("parse journal %s: %w (remove it to start over)", path, err)
 		}
 		if j.entries == nil {
-			lock.Close()
+			lock.Close() // #nosec G104 -- cleanup on error path; the original error is returned
 			return nil, fmt.Errorf("parse journal %s: no entries object (remove it to start over)", path)
 		}
 		for k, e := range j.entries {
 			if k == "" || e.Staged == "" {
-				lock.Close()
+				lock.Close() // #nosec G104 -- cleanup on error path; the original error is returned
 				return nil, fmt.Errorf("parse journal %s: entry %q has no staged name (remove it to start over)", path, k)
 			}
 		}
@@ -103,13 +103,13 @@ func (j *assetJournal) save() error {
 	}
 	defer os.Remove(tmp.Name())
 	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
+		tmp.Close() // #nosec G104 -- cleanup on error path; the write/sync error is returned
 		return fmt.Errorf("write journal: %w", err)
 	}
 	// Sync before the rename: the entry must survive a crash after the upload
 	// it authorises, or the staged copy becomes unprovable.
 	if err := tmp.Sync(); err != nil {
-		tmp.Close()
+		tmp.Close() // #nosec G104 -- cleanup on error path; the write/sync error is returned
 		return fmt.Errorf("write journal: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
@@ -119,8 +119,8 @@ func (j *assetJournal) save() error {
 		return fmt.Errorf("write journal: %w", err)
 	}
 	if dir, err := os.Open(filepath.Dir(j.path)); err == nil {
-		dir.Sync() // best effort: not supported on every platform
-		dir.Close()
+		dir.Sync()  // #nosec G104 -- best-effort directory fsync after a successful rename; unsupported on some platforms
+		dir.Close() // #nosec G104 -- closes the read-only directory handle opened for the best-effort fsync; no data is written through it
 	}
 	return nil
 }

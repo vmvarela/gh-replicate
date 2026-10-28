@@ -585,7 +585,7 @@ func (r *replicator) syncAssets(target string, src, dst release) error {
 	var journal *assetJournal
 	defer func() {
 		if journal != nil {
-			journal.Close()
+			journal.Close() // #nosec G104 -- deferred release of the journal lock at function exit; the closing error is not actionable and loses no journal data, which save() already synced
 		}
 	}()
 
@@ -850,7 +850,7 @@ func getAll[T any](r *replicator, s side, path string) ([]T, error) {
 		}
 		var page []T
 		err = json.NewDecoder(resp.Body).Decode(&page)
-		resp.Body.Close()
+		resp.Body.Close() // #nosec G104 -- HTTP response body closed after decode on every path; the decode error is checked next and a close error loses no data
 		if err != nil {
 			return nil, err
 		}
