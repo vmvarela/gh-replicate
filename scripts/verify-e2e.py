@@ -62,8 +62,23 @@ for tag, r in src.items():
 with open(sys.argv[2]) as f:
     assert json.load(f) == ids(dst), "Second run recreated assets"
 
+def checked(path):
+    try:
+        data = api(path)
+    except (subprocess.CalledProcessError, json.JSONDecodeError) as e:
+        sys.exit(f"API {path} failed: {e}")
+    if not isinstance(data, dict):
+        sys.exit(f"API {path}: malformed response")
+    return data
+
+source_repo, target_repo = checked(f"repos/{source}"), checked(f"repos/{target}")
 for key in ("description", "homepage"):
-    assert api(f"repos/{source}")[key] == api(f"repos/{target}")[key], f"{key} differs"
+    assert source_repo[key] == target_repo[key], f"{key} differs"
+branches = [r.get("default_branch") for r in (source_repo, target_repo)]
+assert all(isinstance(b, str) and b.strip() for b in branches), f"default_branch missing or malformed: {branches!r}"
+assert branches[0] == branches[1], f"default_branch differs: {branches[0]!r} != {branches[1]!r}"
+enabled = checked(f"repos/{target}/actions/permissions").get("enabled")
+assert enabled is False, f"Target Actions must be disabled, enabled={enabled!r}"
 assert set(api(f"repos/{source}/topics")["names"]) <= set(api(f"repos/{target}/topics")["names"])
 labels = {x["name"]: x for x in pages(f"repos/{target}/labels")}
 for label in pages(f"repos/{source}/labels"):
@@ -80,5 +95,5 @@ for name, sha in refs(source).items():
 source_latest = latest(source)
 if source_latest is not None:
     assert latest(target) == source_latest, "Latest release differs"
-print(f"Verified {len(src)} releases, {count} asset digests, refs, metadata, topics, labels, Latest and stable asset IDs.")
+print(f"Verified {len(src)} releases, {count} asset digests, refs, metadata, default branch, disabled Actions, topics, labels, Latest and stable asset IDs.")
 
