@@ -134,6 +134,9 @@ func TestDryRunMakesNoWrites(t *testing.T) {
 	if err := r.syncMetadata("a/b", p); err != nil {
 		t.Fatal(err)
 	}
+	if err := r.syncLabels("a/b", p); err != nil {
+		t.Fatal(err)
+	}
 	out := captureStderr(t, func() {
 		if err := r.syncReleases("a/b", p); err != nil {
 			t.Fatal(err)
@@ -168,7 +171,11 @@ func TestMetadataPreservesTopicsAndUpsertsLabels(t *testing.T) {
 		}
 		fmt.Fprint(w, "{}")
 	})
-	if err := r.syncMetadata("a/b", &plan{topics: topics, labels: []label{{Name: "new"}}}); err != nil {
+	p := &plan{topics: topics, labels: []label{{Name: "new"}}}
+	if err := r.syncMetadata("a/b", p); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.syncLabels("a/b", p); err != nil {
 		t.Fatal(err)
 	}
 	if len(methods) != 4 || methods[3] != "POST /repos/a/b/labels" {
