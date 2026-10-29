@@ -88,14 +88,31 @@ var tokenForAccount = func(login string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
+// isLFSPointer conservatively matches any whole line (surrounding whitespace and
+// CRLF ignored, so extension lines before "version" are tolerated) naming a
+// known version alias.
+// shortcut: only the three aliases Git LFS 3.8.1 accepts, not future versions; upgrade when LFS adds one.
+func isLFSPointer(data []byte) bool {
+	for _, line := range bytes.Split(data, []byte("\n")) {
+		switch string(bytes.TrimSpace(line)) {
+		case "version https://git-lfs.github.com/spec/v1",
+			"version https://hawser.github.com/spec/v1",
+			"version http://git-media.io/v/2":
+			return true
+		}
+	}
+	return false
+}
+
 // Detect LFS pointers reachable from the branches and tags being pushed,
 // including historical versions, but excluding obsolete cached objects.
 func (r *replicator) checkLFS(dir string) error {
 	ctx, cancel := context.WithTimeout(r.ctx, r.timeout)
 	defer cancel()
-	reachable := r.gitCommand(ctx, "", "git", "rev-list", "--objects", "--no-object-names", "--branches", "--tags")
-	check := r.gitCommand(ctx, "", "git", "cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)")
-	read := r.gitCommand(ctx, "", "git", "cat-file", "--batch")
+	// --no-replace-objects: refs/replace in the cache must not hide what gets pushed.
+	reachable := r.gitCommand(ctx, "", "git", "--no-replace-objects", "rev-list", "--objects", "--no-object-names", "--branches", "--tags")
+	check := r.gitCommand(ctx, "", "git", "--no-replace-objects", "cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)")
+	read := r.gitCommand(ctx, "", "git", "--no-replace-objects", "cat-file", "--batch")
 	for _, cmd := range []*exec.Cmd{reachable, check, read} {
 		cmd.Dir = dir
 	}
@@ -139,35 +156,42 @@ func (r *replicator) checkLFS(dir string) error {
 	}
 	reader := bufio.NewReader(contents)
 	scanner := bufio.NewScanner(metadata)
+	prefix := make([]byte, 1024) // Git LFS 3.8.1 only parses this much of a blob.
 	for scanner.Scan() {
 		fields := strings.Fields(scanner.Text())
 		if len(fields) != 3 {
 			return errors.New("invalid git cat-file output")
 		}
-		size, err := strconv.Atoi(fields[2])
+		size, err := strconv.ParseInt(fields[2], 10, 64)
 		if err != nil || size < 0 {
 			return errors.New("invalid Git object size")
 		}
-		if fields[1] != "blob" || size == 0 || size > 1024 {
+		if fields[1] != "blob" || size == 0 {
 			continue
 		}
 		if _, err := fmt.Fprintln(requests, fields[0]); err != nil {
 			return err
 		}
-		line, err := reader.ReadString('\n')
+		line, err := reader.ReadSlice('\n')
 		if err != nil {
-			return err
+			return fmt.Errorf("read git cat-file object header: %w", err)
 		}
-		header := strings.Fields(line)
+		header := strings.Fields(string(line))
 		if len(header) != 3 || header[0] != fields[0] || header[1] != "blob" || header[2] != fields[2] {
 			return errors.New("invalid git cat-file object header")
 		}
-		data := make([]byte, size+1)
-		if _, err := io.ReadFull(reader, data); err != nil {
-			return err
+		n := min(size, int64(len(prefix)))
+		if _, err := io.ReadFull(reader, prefix[:n]); err != nil {
+			return fmt.Errorf("read Git object: %w", err)
 		}
-		if bytes.HasPrefix(data, []byte("version https://git-lfs.github.com/spec/v1\n")) {
+		if isLFSPointer(prefix[:n]) {
 			return errors.New("Git LFS pointers detected; LFS objects are not supported, so replication stopped before destination changes")
+		}
+		if _, err := io.CopyN(io.Discard, reader, size-n); err != nil {
+			return fmt.Errorf("read Git object: %w", err)
+		}
+		if b, err := reader.ReadByte(); err != nil || b != '\n' {
+			return errors.New("invalid git cat-file object framing")
 		}
 	}
 	if err := scanner.Err(); err != nil {

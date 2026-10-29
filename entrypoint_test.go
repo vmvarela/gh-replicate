@@ -453,6 +453,54 @@ func TestSyncGitPropagatesRejectedPush(t *testing.T) {
 	}
 }
 
+func TestLFSSyncGitBlocksHistoricalPointerBeforeDestinationEffects(t *testing.T) {
+	f := newGitFixture(t)
+	work := filepath.Join(t.TempDir(), "w")
+	gitTest(t, filepath.Dir(work), "clone", f.source, work)
+	gitTest(t, work, "config", "user.name", "Test")
+	gitTest(t, work, "config", "user.email", "test@example.com")
+	pointer := "version https://hawser.github.com/spec/v1\r\noid sha256:" + strings.Repeat("a", 64) + "\r\nsize 12\r\n"
+	pointer += strings.Repeat("\n", 2127-len(pointer)) // padded beyond the 1024-byte prefix
+	if err := os.WriteFile(filepath.Join(work, "big.bin"), []byte(pointer), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitTest(t, work, "add", "big.bin")
+	gitTest(t, work, "commit", "-m", "add pointer")
+	gitTest(t, work, "rm", "big.bin")
+	gitTest(t, work, "commit", "-m", "remove pointer")
+	gitTest(t, work, "push", "origin", "main")
+
+	seamStub(t)
+	gitRemote = func(ownerRepo string) string {
+		if ownerRepo == sourceRepo {
+			return f.source
+		}
+		if ownerRepo == targetRepo {
+			return f.destination
+		}
+		t.Fatalf("unexpected repository %q", ownerRepo)
+		return ""
+	}
+	calls := 0
+	side := fakeSide(t, fakeServer(t, func(w http.ResponseWriter, req *http.Request) {
+		calls++
+		fmt.Fprint(w, `{"enabled":false}`)
+	}), "token")
+	for _, dry := range []bool{false, true} {
+		r := &replicator{source: side, target: side, ctx: context.Background(), timeout: time.Minute, dryRun: dry}
+		err := r.syncGit(sourceRepo, targetRepo)
+		if err == nil || !strings.Contains(err.Error(), "Git LFS pointers detected") {
+			t.Fatalf("dryRun=%v error = %v, want LFS detection", dry, err)
+		}
+		if refs := gitRefs(t, f.destination); refs != "" {
+			t.Fatalf("dryRun=%v destination refs published: %q", dry, refs)
+		}
+		if calls != 0 {
+			t.Fatalf("dryRun=%v API called %d times before LFS block", dry, calls)
+		}
+	}
+}
+
 func TestSyncGitClonesAndPushesRefs(t *testing.T) {
 	f := newGitFixture(t)
 	seamStub(t)

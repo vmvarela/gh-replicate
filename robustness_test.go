@@ -274,6 +274,121 @@ func TestLFSPointerDetection(t *testing.T) {
 	}
 }
 
+func TestLFSPointerVariants(t *testing.T) {
+	tail := "oid sha256:" + strings.Repeat("a", 64) + "\nsize 12\n"
+	cases := map[string]struct {
+		content string
+		want    bool
+	}{
+		"lfs":            {"version https://git-lfs.github.com/spec/v1\n" + tail, true},
+		"hawser":         {"version https://hawser.github.com/spec/v1\n" + tail, true},
+		"git-media":      {"version http://git-media.io/v/2\n" + tail, true},
+		"crlf":           {"version https://git-lfs.github.com/spec/v1\r\n" + strings.ReplaceAll(tail, "\n", "\r\n"), true},
+		"whitespace":     {"  \n  version https://hawser.github.com/spec/v1\n" + tail, true},
+		"extension":      {"ext-0-foo sha256:" + strings.Repeat("b", 64) + "\nversion https://git-lfs.github.com/spec/v1\n" + tail, true},
+		"extension-crlf": {"ext-0-foo sha256:" + strings.Repeat("b", 64) + "\r\nversion https://git-lfs.github.com/spec/v1\r\n" + strings.ReplaceAll(tail, "\n", "\r\n"), true},
+		"plain":          {"hello\n", false},
+		"prose":          {"see version https://git-lfs.github.com/spec/v1 for details\n", false},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			gitTest(t, dir, "init", "--bare")
+			cmd := exec.Command("git", "hash-object", "-w", "--stdin")
+			cmd.Dir = dir
+			cmd.Stdin = strings.NewReader(c.content)
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatal(err, string(out))
+			}
+			gitTest(t, dir, "update-ref", "refs/tags/p", strings.TrimSpace(string(out)))
+			r := &replicator{ctx: context.Background(), timeout: time.Minute}
+			err = r.checkLFS(dir)
+			if c.want && (err == nil || !strings.Contains(err.Error(), "Git LFS pointers detected")) {
+				t.Fatalf("error = %v, want LFS detection", err)
+			}
+			if !c.want && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func lfsWorkRepo(t *testing.T, files map[string][]byte) string {
+	t.Helper()
+	dir := t.TempDir()
+	gitTest(t, dir, "init", "-b", "main")
+	gitTest(t, dir, "config", "user.name", "Test")
+	gitTest(t, dir, "config", "user.email", "test@example.com")
+	for name, data := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gitTest(t, dir, "add", ".")
+	gitTest(t, dir, "commit", "-m", "files")
+	return dir
+}
+
+func paddedPointer(size int) []byte {
+	p := "version https://git-lfs.github.com/spec/v1\noid sha256:" + strings.Repeat("a", 64) + "\nsize 12\n"
+	return []byte(p + strings.Repeat("\n", size-len(p)))
+}
+
+func wantLFS(t *testing.T, err error) {
+	t.Helper()
+	if err == nil || !strings.Contains(err.Error(), "Git LFS pointers detected") {
+		t.Fatalf("error = %v, want LFS detection", err)
+	}
+}
+
+func TestLFSPaddedPointerSizes(t *testing.T) {
+	for _, size := range []int{1023, 1024, 1025, 1027, 2127} {
+		t.Run(strconv.Itoa(size), func(t *testing.T) {
+			dir := lfsWorkRepo(t, map[string][]byte{"p.bin": paddedPointer(size)})
+			wantLFS(t, (&replicator{ctx: context.Background(), timeout: time.Minute}).checkLFS(dir))
+		})
+	}
+}
+
+// A large binary blob without trailing LF must be drained exactly so the
+// next object (a pointer) is still framed and inspected, loose or packed.
+func TestLFSFramingAfterLargeBlob(t *testing.T) {
+	big := make([]byte, 70000)
+	for i := range big {
+		big[i] = byte(i*7 + 1)
+		if big[i] == '\n' {
+			big[i] = 0
+		}
+	}
+	r := &replicator{ctx: context.Background(), timeout: time.Minute}
+	plain := lfsWorkRepo(t, map[string][]byte{"a.bin": big, "b.txt": []byte("hi")})
+	if err := r.checkLFS(plain); err != nil {
+		t.Fatal(err)
+	}
+	for _, packed := range []bool{false, true} {
+		dir := lfsWorkRepo(t, map[string][]byte{"a.bin": big, "z.ptr": paddedPointer(200)})
+		if packed {
+			gitTest(t, dir, "repack", "-adq")
+		}
+		wantLFS(t, r.checkLFS(dir))
+	}
+}
+
+func TestLFSIgnoresReplaceRefs(t *testing.T) {
+	dir := lfsWorkRepo(t, map[string][]byte{"p.bin": paddedPointer(300)})
+	pointer := gitTest(t, dir, "rev-parse", "HEAD:p.bin")
+	cmd := exec.Command("git", "hash-object", "-w", "--stdin")
+	cmd.Dir = dir
+	cmd.Stdin = strings.NewReader("harmless\n")
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	gitTest(t, dir, "replace", pointer, strings.TrimSpace(string(out)))
+	wantLFS(t, (&replicator{ctx: context.Background(), timeout: time.Minute}).checkLFS(dir))
+}
+
 func TestAtomicPushAndDryRun(t *testing.T) {
 	src, dst := t.TempDir(), t.TempDir()
 	gitTest(t, src, "init")
