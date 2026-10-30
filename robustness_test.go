@@ -399,9 +399,18 @@ func TestAtomicPushAndDryRun(t *testing.T) {
 	first := gitTest(t, src, "rev-parse", "HEAD")
 	gitTest(t, src, "branch", "a")
 	gitTest(t, src, "branch", "b")
-	gitTest(t, src, "remote", "add", "replicate-target", dst)
+
+	// The push publishes a fetched snapshot, mirroring syncGit's ephemeral bare.
+	aux := newAux(t)
+	gitTest(t, src, "--git-dir="+aux.Dir, "config", "remote.replicate-target.url", dst)
+	syncAux := func() {
+		t.Helper()
+		gitTest(t, src, "--git-dir="+aux.Dir, "fetch", src, "refs/heads/*:refs/heads/*")
+	}
+	syncAux()
+
 	r := &replicator{ctx: context.Background(), timeout: time.Minute}
-	if err := r.pushRefs(src); err != nil {
+	if err := r.pushRefs(aux, sourceRepo); err != nil {
 		t.Fatal(err)
 	}
 	gitTest(t, dst, "update-ref", "refs/heads/destination-only", first)
@@ -409,8 +418,9 @@ func TestAtomicPushAndDryRun(t *testing.T) {
 	second := gitTest(t, src, "rev-parse", "HEAD")
 	gitTest(t, src, "branch", "-f", "a", second)
 	gitTest(t, src, "branch", "-f", "b", second)
+	syncAux()
 	r.dryRun = true
-	if err := r.pushRefs(src); err != nil {
+	if err := r.pushRefs(aux, sourceRepo); err != nil {
 		t.Fatal(err)
 	}
 	if got := gitTest(t, dst, "rev-parse", "a"); got != first {
@@ -421,7 +431,7 @@ func TestAtomicPushAndDryRun(t *testing.T) {
 	if err := os.WriteFile(hook, []byte("#!/bin/sh\n[ \"$1\" != refs/heads/b ]\n"), 0755); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.pushRefs(src); err == nil {
+	if err := r.pushRefs(aux, sourceRepo); err == nil {
 		t.Fatal("expected rejected push")
 	}
 	if got := gitTest(t, dst, "rev-parse", "a"); got != first {
@@ -430,7 +440,7 @@ func TestAtomicPushAndDryRun(t *testing.T) {
 	if err := os.Remove(hook); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.pushRefs(src); err != nil {
+	if err := r.pushRefs(aux, sourceRepo); err != nil {
 		t.Fatal(err)
 	}
 	if got := gitTest(t, dst, "rev-parse", "a"); got != second {
@@ -438,6 +448,35 @@ func TestAtomicPushAndDryRun(t *testing.T) {
 	}
 	if got := gitTest(t, dst, "rev-parse", "destination-only"); got != first {
 		t.Fatal("pruned destination-only ref")
+	}
+}
+
+func TestAtomicPushIgnoresInheritedConfig(t *testing.T) {
+	src, dst := t.TempDir(), t.TempDir()
+	gitTest(t, src, "init")
+	gitTest(t, dst, "init", "--bare")
+	gitTest(t, src, "config", "user.name", "Test")
+	gitTest(t, src, "config", "user.email", "test@example.com")
+	gitTest(t, src, "commit", "--allow-empty", "-m", "first")
+	first := gitTest(t, src, "rev-parse", "HEAD")
+	gitTest(t, src, "branch", "a")
+
+	aux := newAux(t)
+	gitTest(t, src, "--git-dir="+aux.Dir, "config", "remote.replicate-target.url", dst)
+	gitTest(t, src, "--git-dir="+aux.Dir, "fetch", src, "refs/heads/*:refs/heads/*")
+
+	// An inherited pushurl override must be ignored: the push has to go to the
+	// configured destination, not wherever the parent environment points.
+	t.Setenv("GIT_CONFIG_COUNT", "1")
+	t.Setenv("GIT_CONFIG_KEY_0", "remote.replicate-target.pushurl")
+	t.Setenv("GIT_CONFIG_VALUE_0", filepath.Join(t.TempDir(), "wrong.git"))
+
+	r := &replicator{ctx: context.Background(), timeout: time.Minute}
+	if err := r.pushRefs(aux, sourceRepo); err != nil {
+		t.Fatalf("isolated push failed: %v", err)
+	}
+	if got := gitTest(t, dst, "rev-parse", "a"); got != first {
+		t.Fatalf("destination did not receive the snapshot: %q != %q", got, first)
 	}
 }
 

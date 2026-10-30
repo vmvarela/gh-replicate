@@ -25,8 +25,8 @@ const (
 func seamStub(t *testing.T) {
 	t.Helper()
 	isolateCache(t)
-	oldSide, oldRemote := newSide, gitRemote
-	t.Cleanup(func() { newSide, gitRemote = oldSide, oldRemote })
+	oldSide, oldRemote, oldEndpoint := newSide, gitRemote, lfsEndpoint
+	t.Cleanup(func() { newSide, gitRemote, lfsEndpoint = oldSide, oldRemote, oldEndpoint })
 }
 
 type gitFixture struct {
@@ -489,8 +489,8 @@ func TestLFSSyncGitBlocksHistoricalPointerBeforeDestinationEffects(t *testing.T)
 	for _, dry := range []bool{false, true} {
 		r := &replicator{source: side, target: side, ctx: context.Background(), timeout: time.Minute, dryRun: dry}
 		err := r.syncGit(sourceRepo, targetRepo)
-		if err == nil || !strings.Contains(err.Error(), "Git LFS pointers detected") {
-			t.Fatalf("dryRun=%v error = %v, want LFS detection", dry, err)
+		if err == nil || !strings.Contains(err.Error(), "Git LFS blob") {
+			t.Fatalf("dryRun=%v error = %v, want LFS block", dry, err)
 		}
 		if refs := gitRefs(t, f.destination); refs != "" {
 			t.Fatalf("dryRun=%v destination refs published: %q", dry, refs)

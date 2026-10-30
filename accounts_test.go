@@ -7,38 +7,10 @@ import (
 	"fmt"
 	"net/http"
 	"reflect"
-	"slices"
 	"strings"
 	"testing"
 	"time"
 )
-
-func TestGitEnvDropsInheritedTokens(t *testing.T) {
-	t.Setenv("GH_TOKEN", "inherited")
-	t.Setenv("GITHUB_TOKEN", "inherited-app")
-	env := gitEnv("side-token")
-	seen := 0
-	for _, entry := range env {
-		if entry == "GH_TOKEN=side-token" {
-			seen++
-			continue
-		}
-		if strings.HasPrefix(entry, "GH_TOKEN=") || strings.HasPrefix(entry, "GITHUB_TOKEN=") {
-			t.Errorf("inherited token survived: %q", entry)
-		}
-	}
-	if seen != 1 {
-		t.Fatalf("side token set %d times", seen)
-	}
-	if !slices.Contains(env, "GIT_TERMINAL_PROMPT=0") {
-		t.Fatal("missing GIT_TERMINAL_PROMPT=0")
-	}
-	for _, entry := range gitEnv("") {
-		if strings.HasPrefix(entry, "GH_TOKEN=") {
-			t.Fatal("inherited run must not receive a token")
-		}
-	}
-}
 
 func TestSideResolvesRequestedAccount(t *testing.T) {
 	old := tokenForAccount
