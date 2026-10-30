@@ -25,8 +25,8 @@ const (
 func seamStub(t *testing.T) {
 	t.Helper()
 	isolateCache(t)
-	oldSide, oldRemote := newSide, gitRemote
-	t.Cleanup(func() { newSide, gitRemote = oldSide, oldRemote })
+	oldSide, oldRemote, oldEndpoint := newSide, gitRemote, lfsEndpoint
+	t.Cleanup(func() { newSide, gitRemote, lfsEndpoint = oldSide, oldRemote, oldEndpoint })
 }
 
 type gitFixture struct {

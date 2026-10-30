@@ -1,4 +1,4 @@
-//go:build !windows
+//go:build unix
 
 package main
 
@@ -41,5 +41,11 @@ func TestLFSCmdCancelKillsProcessGroup(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	if err := syscall.Kill(pid, 0); err == nil || err != syscall.ESRCH {
 		t.Fatalf("child %d still alive (err=%v)", pid, err)
+	}
+}
+
+func TestLFSTreeCancelEnabled(t *testing.T) {
+	if !lfsTreeCancel {
+		t.Fatal("lfsTreeCancel must be true on platforms where LFS transfer is allowed")
 	}
 }

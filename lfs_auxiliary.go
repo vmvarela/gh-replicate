@@ -107,17 +107,26 @@ func (a *lfsAux) pointHEADAbsent(ctx context.Context) error {
 	if err := a.run(ctx, "--git-dir="+a.Dir, "symbolic-ref", "HEAD", absent); err != nil {
 		return err
 	}
-	// Fail closed if HEAD unexpectedly resolves to a commit.
-	cmd := exec.CommandContext(ctx, a.git, "--git-dir="+a.Dir, "rev-parse", "--verify", "HEAD") // #nosec G204 -- resolved git binary, argv only
+	// Fail closed if HEAD unexpectedly resolves to a commit. --quiet makes a
+	// dangling HEAD exit 1 with no output; any other non-zero exit (git broken,
+	// cancellation, bad git-dir) is a real failure and must abort, not pass.
+	cmd := exec.CommandContext(ctx, a.git, "--git-dir="+a.Dir, "rev-parse", "--verify", "--quiet", "HEAD") // #nosec G204 -- resolved git binary, argv only
 	cmd.Dir, cmd.Env = a.root, a.env
-	if err := cmd.Run(); err == nil {
+	out, err := cmd.Output()
+	if err == nil {
 		return errors.New("ephemeral HEAD resolves; refusing to run LFS")
 	}
-	return nil
+	var ee *exec.ExitError
+	if errors.As(err, &ee) && ee.ExitCode() == 1 && len(out) == 0 {
+		return nil
+	}
+	return fmt.Errorf("verify ephemeral HEAD is absent: %w", err)
 }
 
-// lfsEndpoint is the GitHub LFS API URL for a repo's HTTPS remote.
-func lfsEndpoint(ownerRepo string) string {
+// lfsEndpoint is the GitHub LFS API URL for a repo's HTTPS remote. It is a var
+// so tests can point it at a synthetic server independently of gitRemote, which
+// still drives the plain git fetch/push URL.
+var lfsEndpoint = func(ownerRepo string) string {
 	return gitRemote(ownerRepo) + "/info/lfs"
 }
 

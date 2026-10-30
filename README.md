@@ -92,7 +92,7 @@ Both flags are optional and independent; without them the active account is used
 
 ## Local cache
 
-A per-source lock lives under your OS user cache directory (`gh-replicate/git-v1`) so a second run of the same source fails with the lock path until the first exits. Source history is no longer reused across runs: each run copies into a fresh, private, temporary repository with its own configuration, so an interrupted run leaves no partial state. You can delete the cache directory while no replication is running.
+A per-source lock lives under your OS user cache directory (`gh-replicate/git-v1`) so a second run of the same source fails with the lock path until the first exits. Source history is no longer reused across runs: each run copies into a fresh, private, temporary repository with its own configuration, so no partial state is ever reused. Cleanup is best effort — a hard kill (SIGKILL) can leave a temporary directory behind — and a failed LFS upload can leave objects on the destination without new refs. You can delete the cache directory while no replication is running.
 
 ## License
 

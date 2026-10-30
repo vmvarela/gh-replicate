@@ -466,6 +466,9 @@ func (r *replicator) syncGit(source, target string) error {
 	}
 
 	if len(inv) > 0 {
+		if !lfsTreeCancel {
+			return errors.New("Git LFS transfer is not supported on this platform because cancellation cannot terminate all git-lfs processes")
+		}
 		if err := r.requireLFS(r.ctx, aux, r.source, source); err != nil {
 			return err
 		}

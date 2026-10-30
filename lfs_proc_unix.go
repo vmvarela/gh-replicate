@@ -8,6 +8,10 @@ import (
 	"syscall"
 )
 
+// lfsTreeCancel reports that newLFSCmd cancels the whole process tree; LFS
+// transfer is only allowed on platforms where this holds.
+const lfsTreeCancel = true
+
 // newLFSCmd starts the command in its own process group so a cancellation kills
 // the whole tree, including git-lfs descendants that hold the cache lock.
 func newLFSCmd(ctx context.Context, name string, args ...string) *exec.Cmd {

@@ -7,6 +7,9 @@ import (
 	"os/exec"
 )
 
+// lfsTreeCancel is false on unsupported platforms: LFS transfer is refused.
+const lfsTreeCancel = false
+
 // newLFSCmd on unsupported platforms (e.g. plan9) kills only the direct child.
 // shortcut: git-lfs descendants may survive a cancellation here; LFS transfer is
 // not exercised on these platforms.
