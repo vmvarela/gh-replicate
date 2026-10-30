@@ -199,7 +199,7 @@ func TestLFSIntegrationTransfer(t *testing.T) {
 	if len(inv) != 2 {
 		t.Fatalf("inventory has %d objects, want 2", len(inv))
 	}
-	must(t, a.pointHEADAbsent(context.Background(), refs))
+	must(t, a.pointHEADAbsent(context.Background()))
 
 	must(t, r.transferLFS(context.Background(), a, "src", "dst", refs, inv))
 

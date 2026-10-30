@@ -301,13 +301,13 @@ func TestLFSEndpoint(t *testing.T) {
 
 func TestLFSAuxPointHEADAbsent(t *testing.T) {
 	a := newAux(t)
-	refs := []gitRef{{Name: "refs/heads/gh-replicate-no-lfsconfig", ID: strings.Repeat("1", 40)}}
-	must(t, a.pointHEADAbsent(context.Background(), refs))
-	// The collision guard must pick a name not present in the snapshot.
-	if got := gitTest(t, a.Dir, "--git-dir="+a.Dir, "symbolic-ref", "HEAD"); got != "refs/heads/gh-replicate-no-lfsconfig_" {
+	must(t, a.pointHEADAbsent(context.Background()))
+	// HEAD points outside the refs the fetch writes, and does not resolve.
+	if got := gitTest(t, a.Dir, "--git-dir="+a.Dir, "symbolic-ref", "HEAD"); got != "refs/gh-replicate/no-lfsconfig" {
 		t.Fatalf("HEAD = %q", got)
 	}
-	if gitTest(t, a.Dir, "--git-dir="+a.Dir, "for-each-ref", "--format=%(refname)") != "" {
-		t.Fatalf("absent ref was materialized")
+	cmd := exec.Command("git", "--git-dir="+a.Dir, "rev-parse", "--verify", "HEAD")
+	if err := cmd.Run(); err == nil {
+		t.Fatal("absent HEAD unexpectedly resolves")
 	}
 }

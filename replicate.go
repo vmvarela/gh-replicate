@@ -469,7 +469,7 @@ func (r *replicator) syncGit(source, target string) error {
 		if err := r.requireLFS(r.ctx, aux, r.source, source); err != nil {
 			return err
 		}
-		if err := aux.pointHEADAbsent(r.ctx, refs); err != nil {
+		if err := aux.pointHEADAbsent(r.ctx); err != nil {
 			return err
 		}
 		if r.dryRun {
@@ -481,16 +481,18 @@ func (r *replicator) syncGit(source, target string) error {
 
 	r.disableActions(target)
 	fmt.Fprintf(os.Stderr, "  Pushing branches and tags to %s...\n", target)
-	return r.pushRefs(aux.Dir)
+	return r.pushRefs(aux, target)
 }
 
-func (r *replicator) pushRefs(gitDir string) error {
+// pushRefs publishes the snapshot with the same isolated per-side environment
+// as the LFS transfer, so inherited config or env cannot redirect the push.
+func (r *replicator) pushRefs(a *lfsAux, target string) error {
 	args := []string{"push", "--atomic", "--force"}
 	if r.dryRun {
 		args = append(args, "--dry-run")
 	}
 	args = append(args, "replicate-target", "refs/heads/*:refs/heads/*", "refs/tags/*:refs/tags/*")
-	if err := r.command(gitDir, r.target, "git", args...); err != nil {
+	if err := r.lfsRun(r.ctx, a, r.target, target, args...); err != nil {
 		return fmt.Errorf("push refs: %w", err)
 	}
 	return nil

@@ -185,17 +185,22 @@ func parseLFSMarks(data string, oids []string) (map[string]string, error) {
 var lfsBlobIDRE = regexp.MustCompile(`\A[0-9a-f]{40}\z`)
 
 // pointHEADAbsent sets HEAD to a ref guaranteed absent from the snapshot, so
-// git-lfs cannot read a .lfsconfig committed in the replicated history.
-func (a *lfsAux) pointHEADAbsent(ctx context.Context, refs []gitRef) error {
-	name := "refs/heads/gh-replicate-no-lfsconfig"
-	seen := make(map[string]bool, len(refs))
-	for _, ref := range refs {
-		seen[ref.Name] = true
+// git-lfs cannot read a .lfsconfig committed in the replicated history. The
+// namespace refs/gh-replicate/ is outside refs/heads and refs/tags (the only
+// namespaces the fetch writes), so it cannot collide with a replicated branch
+// on a case-insensitive filesystem.
+func (a *lfsAux) pointHEADAbsent(ctx context.Context) error {
+	const absent = "refs/gh-replicate/no-lfsconfig"
+	if err := a.run(ctx, "--git-dir="+a.Dir, "symbolic-ref", "HEAD", absent); err != nil {
+		return err
 	}
-	for seen[name] {
-		name += "_"
+	// Fail closed if HEAD unexpectedly resolves to a commit.
+	cmd := exec.CommandContext(ctx, a.git, "--git-dir="+a.Dir, "rev-parse", "--verify", "HEAD") // #nosec G204 -- resolved git binary, argv only
+	cmd.Dir, cmd.Env = a.root, a.env
+	if err := cmd.Run(); err == nil {
+		return errors.New("ephemeral HEAD resolves; refusing to run LFS")
 	}
-	return a.run(ctx, "--git-dir="+a.Dir, "symbolic-ref", "HEAD", name)
+	return nil
 }
 
 // lfsEndpoint is the GitHub LFS API URL for a repo's HTTPS remote.
@@ -221,7 +226,9 @@ func lfsSideEnv(root, token, path string) []string {
 	if token != "" {
 		env = append(env, "GH_TOKEN="+token)
 	}
-	for _, k := range []string{"HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "ALL_PROXY", "GIT_SSL_CAINFO", "SSL_CERT_FILE"} {
+	// Preserve both spellings: proxies conventionally honor lowercase, and the
+	// previous gitEnv inherited everything, so dropping one would regress.
+	for _, k := range []string{"HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "NO_PROXY", "no_proxy", "ALL_PROXY", "all_proxy", "GIT_SSL_CAINFO", "SSL_CERT_FILE"} {
 		if v := os.Getenv(k); v != "" {
 			env = append(env, k+"="+v)
 		}
@@ -246,7 +253,7 @@ func (r *replicator) lfsCmd(ctx context.Context, a *lfsAux, s side, ownerRepo st
 	full := append([]string{"-c", "credential.helper=", "-c", "credential.https://github.com.helper=!gh auth git-credential",
 		"-c", "lfs.url=" + lfsEndpoint(ownerRepo), "-c", "lfs.pushurl=" + lfsEndpoint(ownerRepo),
 		"-c", "lfs.standalonetransferagent=" + lfsStandaloneAgent}, args...)
-	cmd := exec.CommandContext(ctx, a.git, full...) // #nosec G204 -- resolved git binary, argv only
+	cmd := newLFSCmd(ctx, a.git, full...) // #nosec G204 -- resolved git binary, argv only
 	cmd.Dir = a.Dir
 	cmd.Env = lfsSideEnv(a.root, s.token, os.Getenv("PATH"))
 	if r.cacheLock != nil {
