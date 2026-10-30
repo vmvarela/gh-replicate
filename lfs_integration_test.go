@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -139,6 +140,10 @@ func sha256hex(data []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func canonicalPointer(oid string, size int64) string {
+	return "version https://git-lfs.github.com/spec/v1\noid sha256:" + oid + "\nsize " + strconv.FormatInt(size, 10) + "\n"
+}
+
 // TestLFSIntegrationTransfer runs the real transferLFS path over HTTP against a
 // real git-lfs: a source bare with historical and tagged canonical pointers, an
 // isolated source LFS server, and a fresh destination server. It requires
@@ -163,11 +168,11 @@ func TestLFSIntegrationTransfer(t *testing.T) {
 	gitTest(t, work, "init", "-b", "main")
 	gitTest(t, work, "config", "user.name", "Test")
 	gitTest(t, work, "config", "user.email", "test@example.com")
-	must(t, os.WriteFile(filepath.Join(work, "a.bin"), []byte(lfsCanonicalPointer(oid1, int64(len(content1)))), 0o644))
+	must(t, os.WriteFile(filepath.Join(work, "a.bin"), []byte(canonicalPointer(oid1, int64(len(content1)))), 0o644))
 	gitTest(t, work, "add", ".")
 	gitTest(t, work, "commit", "-m", "v1")
 	gitTest(t, work, "tag", "v1")
-	must(t, os.WriteFile(filepath.Join(work, "a.bin"), []byte(lfsCanonicalPointer(oid2, int64(len(content2)))), 0o644))
+	must(t, os.WriteFile(filepath.Join(work, "a.bin"), []byte(canonicalPointer(oid2, int64(len(content2)))), 0o644))
 	gitTest(t, work, "add", ".")
 	gitTest(t, work, "commit", "-m", "v2")
 	gitTest(t, work, "push", "file://"+srcBare, "refs/heads/main:refs/heads/main", "refs/tags/v1:refs/tags/v1")

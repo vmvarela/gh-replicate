@@ -1,18 +1,11 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"testing"
 )
@@ -141,118 +134,6 @@ func TestLFSAuxCleansOnFailure(t *testing.T) {
 	must(t, err)
 	if len(ents) != 0 {
 		t.Fatalf("leftovers: %v", ents)
-	}
-}
-
-func TestLFSAuxWritePointers(t *testing.T) {
-	a := newAux(t)
-	sel, err := a.writePointers(context.Background(), lfsInventory{})
-	must(t, err)
-	if len(sel) != 0 {
-		t.Fatal("empty inventory must yield no selectors")
-	}
-	for _, bad := range []lfsInventory{
-		{"xyz": 1},
-		{strings.Repeat("A", 64): 1},
-		{strings.Repeat("a", 64): 0},
-		{strings.Repeat("a", 64): -1},
-	} {
-		if _, err := a.writePointers(context.Background(), bad); err == nil {
-			t.Fatalf("accepted %v", bad)
-		}
-	}
-	inv := lfsInventory{}
-	for i := 0; i < 3000; i++ {
-		h := sha256.Sum256([]byte(strconv.Itoa(i)))
-		inv[hex.EncodeToString(h[:])] = int64(i + 1)
-	}
-	sel, err = a.writePointers(context.Background(), inv)
-	must(t, err)
-	if len(sel) != len(inv) {
-		t.Fatalf("%d selectors for %d objects", len(sel), len(inv))
-	}
-	// Stream every selector through cat-file and compare bytes and blob id.
-	var q strings.Builder
-	oids := make([]string, 0, len(sel))
-	for oid, id := range sel {
-		oids = append(oids, oid)
-		q.WriteString(id + "\n")
-	}
-	cmd := exec.Command(a.git, "--git-dir="+a.Dir, "cat-file", "--batch")
-	cmd.Env, cmd.Stdin = a.env, strings.NewReader(q.String())
-	out, err := cmd.Output()
-	must(t, err)
-	r := bufio.NewReader(bytes.NewReader(out))
-	seen := map[string]bool{}
-	for _, oid := range oids {
-		hdr, err := r.ReadString('\n')
-		must(t, err)
-		var id, typ string
-		var n int
-		if _, err := fmt.Sscanf(hdr, "%s %s %d", &id, &typ, &n); err != nil || typ != "blob" || id != sel[oid] || seen[id] {
-			t.Fatalf("bad header %q for %s", hdr, oid)
-		}
-		seen[id] = true
-		body := make([]byte, n+1)
-		_, err = io.ReadFull(r, body)
-		must(t, err)
-		if string(body[:n]) != lfsCanonicalPointer(oid, inv[oid]) {
-			t.Fatalf("pointer mismatch for %s: %q", oid, body[:n])
-		}
-		if lfs, err := exec.LookPath("git-lfs"); err == nil && len(seen) <= 3 {
-			c := exec.Command(lfs, "pointer", "--check", "--strict", "--stdin")
-			c.Env, c.Stdin = a.env, bytes.NewReader(body[:n])
-			if out, err := c.CombinedOutput(); err != nil {
-				t.Fatalf("git-lfs rejects pointer: %v %s", err, out)
-			}
-		}
-	}
-	refs := exec.Command(a.git, "--git-dir="+a.Dir, "for-each-ref")
-	refs.Env = a.env
-	out, err = refs.Output()
-	must(t, err)
-	if len(out) != 0 {
-		t.Fatalf("refs created: %s", out)
-	}
-	if _, err := os.Stat(filepath.Join(a.root, "marks")); !os.IsNotExist(err) {
-		t.Fatalf("marks left: %v", err)
-	}
-}
-
-func TestLFSAuxWritePointersCanceled(t *testing.T) {
-	a := newAux(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if _, err := a.writePointers(ctx, lfsInventory{}); err == nil {
-		t.Fatal("canceled ctx with empty inventory must fail")
-	}
-	inv := lfsInventory{strings.Repeat("a", 64): 1}
-	if _, err := a.writePointers(ctx, inv); err == nil {
-		t.Fatal("canceled ctx must fail")
-	}
-}
-
-func TestLFSParseMarks(t *testing.T) {
-	id1, id2 := strings.Repeat("1", 40), strings.Repeat("2", 40)
-	oids := []string{"a", "b"}
-	if sel, err := parseLFSMarks(":1 "+id1+"\n:2 "+id2+"\n", oids); err != nil || sel["b"] != id2 {
-		t.Fatalf("valid rejected: %v", err)
-	}
-	for _, bad := range []string{
-		":1 " + id1,                                     // missing mark
-		":1 " + id1 + "\n:1 " + id2,                     // duplicate mark
-		":1 " + id1 + "\n:2 " + id1,                     // duplicate blob id
-		":1 " + id1 + "\n:3 " + id2,                     // out of range
-		":1 " + id1 + "\n:2 " + strings.Repeat("G", 40), // non-hex
-		":1 " + id1 + "\n:2 " + strings.Repeat("A", 40), // uppercase
-		":1 " + id1 + "\n:2 " + strings.Repeat("2", 64), // sha256-length id
-		":1 " + id1 + "\n:2 " + id2 + " extra",
-		":1 " + id1 + "\n:+2 " + id2,
-		":1 " + id1 + "\n garbage",
-	} {
-		if _, err := parseLFSMarks(bad, oids); err == nil {
-			t.Fatalf("accepted %q", bad)
-		}
 	}
 }
 

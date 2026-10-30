@@ -1,17 +1,13 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"runtime"
-	"sort"
-	"strconv"
 	"strings"
 )
 
@@ -24,8 +20,9 @@ type lfsAux struct {
 	git  string
 }
 
-// Env is built from scratch: no inherited GIT_*, PATH, HOME or tokens.
-// shortcut: no PATH, so git helpers/git-lfs are not found; add when transfers are wired.
+// lfsAuxEnv is the scratch environment for a.run, which only invokes local git
+// commands (init, config, symbolic-ref) and so needs no PATH. The transfer
+// commands run through lfsSideEnv instead.
 func lfsAuxEnv(root string) []string {
 	env := []string{
 		"HOME=" + root, "USERPROFILE=" + root, "XDG_CONFIG_HOME=" + filepath.Join(root, "xdg"),
@@ -99,90 +96,6 @@ func (a *lfsAux) Close() error {
 	}
 	return err
 }
-
-// lfsCanonicalPointer is the exact pointer text git-lfs writes (spec v1, no extensions).
-func lfsCanonicalPointer(oid string, size int64) string {
-	return fmt.Sprintf("version https://git-lfs.github.com/spec/v1\noid sha256:%s\nsize %d\n", oid, size)
-}
-
-// writePointers stores one canonical pointer blob per inventory object and
-// returns oid -> blob id, an unambiguous selector. fast-import streams the
-// blobs over stdin (no argv limits) and, with no commit/reset commands,
-// creates no refs. An empty inventory runs nothing.
-func (a *lfsAux) writePointers(ctx context.Context, inv lfsInventory) (map[string]string, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	oids := make([]string, 0, len(inv))
-	for oid, size := range inv {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		if !lfsBareOIDRE.MatchString(oid) {
-			return nil, fmt.Errorf("invalid Git LFS object id %q", oid)
-		}
-		if size <= 0 {
-			return nil, fmt.Errorf("invalid Git LFS size %d for object %s", size, oid)
-		}
-		oids = append(oids, oid)
-	}
-	sel := make(map[string]string, len(oids))
-	if len(oids) == 0 {
-		return sel, nil
-	}
-	sort.Strings(oids)
-	var in bytes.Buffer
-	// shortcut: fast-import gets the whole input as one in-memory buffer (~150 B
-	// per object); switch to an io.Pipe writer if inventories reach millions of objects.
-	for i, oid := range oids {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		p := lfsCanonicalPointer(oid, inv[oid])
-		fmt.Fprintf(&in, "blob\nmark :%d\ndata %d\n%s\n", i+1, len(p), p)
-	}
-	in.WriteString("done\n")
-	marks := filepath.Join(a.root, "marks")
-	defer os.Remove(marks)
-	cmd := exec.CommandContext(ctx, a.git, "--git-dir="+a.Dir, "fast-import", "--quiet", "--done", "--export-marks="+marks) // #nosec G204 -- resolved git binary, argv only
-	cmd.Dir, cmd.Env, cmd.Stdin = a.root, a.env, &in
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("git fast-import: %w: %s", err, out)
-	}
-	data, err := os.ReadFile(marks)
-	if err != nil {
-		return nil, err
-	}
-	return parseLFSMarks(string(data), oids)
-}
-
-// parseLFSMarks fails closed: exactly one ":N <40 lowercase hex>" line per
-// mark 1..len(oids), no duplicates, no extra fields.
-func parseLFSMarks(data string, oids []string) (map[string]string, error) {
-	sel := make(map[string]string, len(oids))
-	seen := map[string]bool{}
-	for _, line := range strings.Split(strings.TrimSpace(data), "\n") {
-		f := strings.Fields(line)
-		if len(f) != 2 || !strings.HasPrefix(f[0], ":") || !lfsBlobIDRE.MatchString(f[1]) {
-			return nil, fmt.Errorf("unexpected fast-import mark %q", line)
-		}
-		mark, err := strconv.Atoi(f[0][1:])
-		if err != nil || mark < 1 || mark > len(oids) || f[0] != ":"+strconv.Itoa(mark) {
-			return nil, fmt.Errorf("unexpected fast-import mark %q", line)
-		}
-		if _, dup := sel[oids[mark-1]]; dup || seen[f[1]] {
-			return nil, fmt.Errorf("duplicate fast-import mark %q", line)
-		}
-		seen[f[1]] = true
-		sel[oids[mark-1]] = f[1]
-	}
-	if len(sel) != len(oids) {
-		return nil, fmt.Errorf("fast-import returned %d of %d pointers", len(sel), len(oids))
-	}
-	return sel, nil
-}
-
-var lfsBlobIDRE = regexp.MustCompile(`\A[0-9a-f]{40}\z`)
 
 // pointHEADAbsent sets HEAD to a ref guaranteed absent from the snapshot, so
 // git-lfs cannot read a .lfsconfig committed in the replicated history. The
