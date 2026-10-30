@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -104,13 +106,146 @@ func isLFSPointer(data []byte) bool {
 	return false
 }
 
+var errLFSBlocked = errors.New("Git LFS pointers detected; LFS objects are not supported, so replication stopped before destination changes")
+
+// Git ancestry and repository-redirect overrides could make the scan read a
+// truncated or different history than the refs actually reference. Rejecting
+// is safer than silently stripping: a caller who needs these should get a
+// clear failure, not an incomplete LFS decision. Replacements are handled
+// separately with --no-replace-objects.
+var gitAncestryOverrideVars = []string{
+	"GIT_DIR", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY",
+	"GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_INDEX_FILE", "GIT_WORK_TREE",
+	"GIT_NAMESPACE", "GIT_GRAFT_FILE", "GIT_SHALLOW_FILE", "GIT_REPLACE_REF_BASE",
+}
+
+func rejectGitAncestryOverrides() error {
+	for _, k := range gitAncestryOverrideVars {
+		if v, ok := os.LookupEnv(k); ok && v != "" {
+			return fmt.Errorf("refusing to scan for Git LFS with %s set in the environment", k)
+		}
+	}
+	return nil
+}
+
+// verifyNoHistoryTruncation rejects cache state that could prune commit
+// ancestry: a physical shallow or grafts file, or a commondir redirect. A
+// stat error is an error, not proof of absence; an existing entry (even a
+// symlink or empty file) means the cache is not trustworthy to scan.
+func verifyNoHistoryTruncation(dir string) error {
+	for _, rel := range []string{"shallow", "info/grafts", "commondir"} {
+		p := filepath.Join(dir, rel)
+		if _, err := os.Lstat(p); err == nil {
+			return fmt.Errorf("refusing to scan for Git LFS: cache has %s, which may truncate history", rel)
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("inspect cache %s: %w", rel, err)
+		}
+	}
+	return nil
+}
+
+// guardLFSScan is the entry guard for any LFS history traversal over the cache:
+// cancellation, inherited overrides and physical truncation all fail closed.
+func (r *replicator) guardLFSScan(dir string) error {
+	if err := r.ctx.Err(); err != nil {
+		return err
+	}
+	if err := rejectGitAncestryOverrides(); err != nil {
+		return err
+	}
+	return verifyNoHistoryTruncation(dir)
+}
+
 // Detect LFS pointers reachable from the branches and tags being pushed,
 // including historical versions, but excluding obsolete cached objects.
+// Any line naming a known version alias blocks, confirmed pointer or not.
 func (r *replicator) checkLFS(dir string) error {
+	if err := r.guardLFSScan(dir); err != nil {
+		return err
+	}
+	return r.scanLFSBlobs(dir, []string{"--branches", "--tags"}, nil, func(_ string, _ int64, prefix []byte) error {
+		if isLFSPointer(prefix) {
+			return errLFSBlocked
+		}
+		return nil
+	})
+}
+
+// gitRef is a captured refs/heads or refs/tags entry; ID may name a commit, an
+// annotated tag, or a tag pointing at a blob or tree.
+type gitRef struct{ Name, ID string }
+
+var gitObjectIDRE = regexp.MustCompile(`\A([0-9a-f]{40}|[0-9a-f]{64})\z`)
+
+// captureRefs records the names and object IDs of refs/heads and refs/tags once.
+// Call it under the caller's cache lock; later ref changes do not affect it.
+func (r *replicator) captureRefs(dir string) ([]gitRef, error) {
+	ctx, cancel := context.WithTimeout(r.ctx, r.timeout)
+	defer cancel()
+	cmd := r.gitCommand(ctx, "", "git", "--no-replace-objects", "for-each-ref", "--format=%(objectname) %(refname)", "refs/heads", "refs/tags")
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("capture refs: %w", err)
+	}
+	var refs []gitRef
+	for _, line := range strings.Split(strings.TrimSuffix(string(out), "\n"), "\n") {
+		if line == "" {
+			continue
+		}
+		id, name, ok := strings.Cut(line, " ")
+		if !ok || !gitObjectIDRE.MatchString(id) || name == "" {
+			return nil, errors.New("invalid git for-each-ref output")
+		}
+		refs = append(refs, gitRef{Name: name, ID: id})
+	}
+	return refs, nil
+}
+
+// inventoryLFS maps OID to size for every pointer reachable from the captured
+// refs only (later ref changes are ignored). An empty capture is an empty
+// inventory, never "all refs". It fails closed: the first ambiguous candidate
+// or conflicting size aborts with an error naming the blob, and no inventory is
+// returned. A valid inventory visits every blob.
+func (r *replicator) inventoryLFS(dir string, refs []gitRef) (lfsInventory, error) {
+	if err := r.guardLFSScan(dir); err != nil {
+		return nil, err
+	}
+	inv := lfsInventory{}
+	if len(refs) == 0 {
+		return inv, nil
+	}
+	var tips strings.Builder // via stdin: no argv limit
+	for _, ref := range refs {
+		tips.WriteString(ref.ID + "\n")
+	}
+	err := r.scanLFSBlobs(dir, []string{"--stdin"}, strings.NewReader(tips.String()), func(blobID string, size int64, prefix []byte) error {
+		p, found, blocked := classifyLFSBlob(prefix, size)
+		if blocked != "" {
+			return fmt.Errorf("Git LFS blob %s: %s", blobID, blocked)
+		}
+		if found {
+			if err := inv.add(p); err != nil {
+				return fmt.Errorf("Git LFS blob %s: %w", blobID, err)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return inv, nil
+}
+
+// scanLFSBlobs streams every non-empty blob reachable from the rev-list
+// selection (flags, optionally with stdin revisions) and calls visit with its object ID, size and first min(size,1024) bytes
+// (valid only during the call). A visit error aborts the scan.
+func (r *replicator) scanLFSBlobs(dir string, revs []string, revsIn io.Reader, visit func(blobID string, size int64, prefix []byte) error) error {
 	ctx, cancel := context.WithTimeout(r.ctx, r.timeout)
 	defer cancel()
 	// --no-replace-objects: refs/replace in the cache must not hide what gets pushed.
-	reachable := r.gitCommand(ctx, "", "git", "--no-replace-objects", "rev-list", "--objects", "--no-object-names", "--branches", "--tags")
+	reachable := r.gitCommand(ctx, "", "git", append([]string{"--no-replace-objects", "rev-list", "--objects", "--no-object-names"}, revs...)...)
+	reachable.Stdin = revsIn
 	check := r.gitCommand(ctx, "", "git", "--no-replace-objects", "cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)")
 	read := r.gitCommand(ctx, "", "git", "--no-replace-objects", "cat-file", "--batch")
 	for _, cmd := range []*exec.Cmd{reachable, check, read} {
@@ -184,8 +319,8 @@ func (r *replicator) checkLFS(dir string) error {
 		if _, err := io.ReadFull(reader, prefix[:n]); err != nil {
 			return fmt.Errorf("read Git object: %w", err)
 		}
-		if isLFSPointer(prefix[:n]) {
-			return errors.New("Git LFS pointers detected; LFS objects are not supported, so replication stopped before destination changes")
+		if err := visit(fields[0], size, prefix[:n]); err != nil {
+			return err
 		}
 		if _, err := io.CopyN(io.Discard, reader, size-n); err != nil {
 			return fmt.Errorf("read Git object: %w", err)

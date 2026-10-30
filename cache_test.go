@@ -66,7 +66,7 @@ func TestCacheLockReleasedAfterProcessDeath(t *testing.T) {
 	f.Close()
 }
 
-func TestSyncGitCacheLifecycle(t *testing.T) {
+func TestSyncGitLifecycle(t *testing.T) {
 	f := newGitFixture(t)
 	seamStub(t)
 	gitRemote = func(repo string) string {
@@ -84,46 +84,22 @@ func TestSyncGitCacheLifecycle(t *testing.T) {
 		}
 	}
 	sync()
-	root, err := os.UserCacheDir()
-	if err != nil {
-		t.Fatal(err)
-	}
-	caches, err := filepath.Glob(filepath.Join(root, "gh-replicate", "git-v1", "*.git"))
-	if err != nil || len(caches) != 1 {
-		t.Fatalf("caches %v: %v", caches, err)
-	}
-	marker := filepath.Join(caches[0], "reused")
-	if err := os.WriteFile(marker, []byte("keep"), 0600); err != nil {
-		t.Fatal(err)
-	}
 	base := gitTest(t, f.source, "rev-parse", "main")
 	gitTest(t, f.destination, "update-ref", "refs/heads/exclusive", base)
 	gitTest(t, f.destination, "update-ref", "refs/tags/exclusive", base)
 	gitTest(t, f.source, "update-ref", "refs/heads/new", base)
 	sync()
-	if _, err := os.Stat(marker); err != nil {
-		t.Fatal("cache was recreated", err)
-	}
 	gitTest(t, f.source, "update-ref", "-d", "refs/heads/new")
 	gitTest(t, f.source, "update-ref", "-d", "refs/tags/v1")
 	sync()
-	if refs := gitRefs(t, caches[0]); strings.Contains(refs, "refs/heads/new") || strings.Contains(refs, "refs/tags/v1") {
-		t.Fatal("stale source refs", refs)
-	}
+	// The destination push does not prune destination-only refs, and deleting a
+	// source ref must not delete it from the destination.
 	for _, ref := range []string{"refs/heads/new", "refs/tags/v1", "refs/heads/exclusive", "refs/tags/exclusive"} {
 		if got := gitTest(t, f.destination, "rev-parse", ref); got != base {
 			t.Fatalf("lost destination ref %s", ref)
 		}
 	}
-	// A cached ref the source renamed into its own path must not block the
-	// fetch: one atomic fetch cannot delete and create these refs together.
-	gitTest(t, caches[0], "update-ref", "refs/heads/release", base)
-	gitTest(t, f.source, "update-ref", "refs/heads/release/v2", base)
-	sync()
-	if got := gitTest(t, f.destination, "rev-parse", "refs/heads/release/v2"); got != base {
-		t.Fatalf("renamed ref %s", got)
-	}
-	// A stale push would recreate this ref, making the assertion observable.
+	// A failed fetch must not change the destination and must release the lock.
 	gitTest(t, f.destination, "update-ref", "-d", "refs/heads/main")
 	before := gitRefs(t, f.destination)
 	if err := os.Rename(f.source, f.source+".offline"); err != nil {
@@ -286,42 +262,14 @@ func TestSyncGitNewObjectsAndSecondTarget(t *testing.T) {
 			t.Fatal(got)
 		}
 	}
-	root, err := os.UserCacheDir()
-	if err != nil {
-		t.Fatal(err)
-	}
-	caches, err := filepath.Glob(filepath.Join(root, "gh-replicate", "git-v1", "*.git"))
-	if err != nil || len(caches) != 1 {
-		t.Fatalf("expected shared source cache: %v %v", caches, err)
-	}
 }
 
-// A local SHA-256 default must not leak into the cache: GitHub serves SHA-1.
+// A local SHA-256 default must not leak into the ephemeral bare: GitHub serves SHA-1.
 func TestSyncGitPinsSHA1ObjectFormat(t *testing.T) {
-	f := newGitFixture(t)
-	seamStub(t)
 	t.Setenv("GIT_DEFAULT_HASH", "sha256")
-	gitRemote = func(repo string) string {
-		if repo == sourceRepo {
-			return f.source
-		}
-		return f.destination
-	}
-	s := fakeSide(t, fakeServer(t, func(w http.ResponseWriter, req *http.Request) { fmt.Fprint(w, `{"enabled":false}`) }), "token")
-	r := &replicator{source: s, target: s, ctx: context.Background(), timeout: time.Minute}
-	if err := r.syncGit(sourceRepo, targetRepo); err != nil {
-		t.Fatal(err)
-	}
-	root, err := os.UserCacheDir()
-	if err != nil {
-		t.Fatal(err)
-	}
-	caches, err := filepath.Glob(filepath.Join(root, "gh-replicate", "git-v1", "*.git"))
-	if err != nil || len(caches) != 1 {
-		t.Fatalf("caches %v: %v", caches, err)
-	}
-	if got := gitTest(t, caches[0], "rev-parse", "--show-object-format"); got != "sha1" {
-		t.Fatalf("cache object format %s", got)
+	a := newAux(t)
+	if got := gitTest(t, a.Dir, "--git-dir="+a.Dir, "rev-parse", "--show-object-format"); got != "sha1" {
+		t.Fatalf("ephemeral bare object format %s", got)
 	}
 }
 

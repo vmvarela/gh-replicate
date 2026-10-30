@@ -419,10 +419,12 @@ func (r *replicator) syncGit(source, target string) error {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("create cache directory: %w", err)
 	}
-	// Share source objects across destinations without persisting credentials.
+	// The lock still lives at the source-keyed path so concurrent replications of
+	// the same source coordinate. The incremental cache itself is no longer used:
+	// the transfer runs in an ephemeral bare with isolated config, so a hostile
+	// or stale cache cannot steer the fetch, scan or push.
 	key := fmt.Sprintf("%x", sha256.Sum256([]byte(gitRemote(source))))
-	gitDir := filepath.Join(dir, key+".git")
-	lock, err := lockCache(gitDir + ".lock")
+	lock, err := lockCache(filepath.Join(dir, key+".git.lock"))
 	if err != nil {
 		return err
 	}
@@ -431,38 +433,55 @@ func (r *replicator) syncGit(source, target string) error {
 	locked.cacheLock = lock
 	r = &locked
 
-	if err := os.MkdirAll(gitDir, 0700); err != nil {
-		return fmt.Errorf("create source cache: %w", err)
+	initCtx, cancel := context.WithTimeout(r.ctx, r.timeout)
+	aux, err := newLFSAux(initCtx)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("create ephemeral bare: %w", err)
 	}
-	// init is idempotent, including after an interrupted first initialization.
-	// Pin SHA-1 like GitHub, so a local sha256 default cannot break the fetch.
-	if err := r.command("", r.source, "git", "init", "--bare", "--quiet", "--object-format=sha1", gitDir); err != nil {
-		return fmt.Errorf("initialize source cache: %w", err)
-	}
-	if err := r.command(gitDir, r.target, "git", "config", "--local",
-		"remote.replicate-target.url", gitRemote(target)); err != nil {
-		return fmt.Errorf("configure destination remote: %w", err)
-	}
+	defer aux.Close()
 
-	fmt.Fprintf(os.Stderr, "  Fetching branches and tags from %s (cache: %s)...\n", source, gitDir)
-	// Prune stale source refs locally so deleted source refs are never pushed
-	// back. The destination push does not prune destination-only refs.
+	fmt.Fprintf(os.Stderr, "  Fetching branches and tags from %s...\n", source)
 	// Fetch must succeed on every run; never push a stale cache after failure.
-	// Not --atomic: a rename like release -> release/v2 cannot delete and create
-	// in one transaction, and that failure would persist in the shared cache.
-	if err := r.command(gitDir, r.source, "git", "fetch", "--prune", "--no-tags",
+	if err := r.lfsRun(r.ctx, aux, r.source, source, "fetch", "--prune", "--no-tags",
 		gitRemote(source),
 		"+refs/heads/*:refs/heads/*",
 		"+refs/tags/*:refs/tags/*"); err != nil {
 		return fmt.Errorf("fetch source: %w", err)
 	}
-	if err := r.checkLFS(gitDir); err != nil {
+	if err := aux.run(r.ctx, "--git-dir="+aux.Dir, "config", "remote.replicate-target.url", gitRemote(target)); err != nil {
+		return fmt.Errorf("configure destination remote: %w", err)
+	}
+
+	if err := r.guardLFSScan(aux.Dir); err != nil {
 		return err
+	}
+	refs, err := r.captureRefs(aux.Dir)
+	if err != nil {
+		return err
+	}
+	inv, err := r.inventoryLFS(aux.Dir, refs)
+	if err != nil {
+		return err
+	}
+
+	if len(inv) > 0 {
+		if err := r.requireLFS(r.ctx, aux, r.source, source); err != nil {
+			return err
+		}
+		if err := aux.pointHEADAbsent(r.ctx, refs); err != nil {
+			return err
+		}
+		if r.dryRun {
+			fmt.Fprintf(os.Stderr, "  Would transfer %d Git LFS objects from %s to %s\n", len(inv), source, target)
+		} else if err := r.transferLFS(r.ctx, aux, source, target, refs, inv); err != nil {
+			return err
+		}
 	}
 
 	r.disableActions(target)
 	fmt.Fprintf(os.Stderr, "  Pushing branches and tags to %s...\n", target)
-	return r.pushRefs(gitDir)
+	return r.pushRefs(aux.Dir)
 }
 
 func (r *replicator) pushRefs(gitDir string) error {
