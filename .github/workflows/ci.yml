@@ -27,6 +27,23 @@ jobs:
       - run: python3 scripts/test_verify_e2e.py -v
 
 
+  lfs-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.3'
+          cache: true
+      - name: Install Git LFS 3.8.1
+        run: |
+          curl -sSLo git-lfs.tar.gz https://github.com/git-lfs/git-lfs/releases/download/v3.8.1/git-lfs-linux-amd64-v3.8.1.tar.gz
+          tar -xzf git-lfs.tar.gz
+          echo "$PWD/git-lfs-3.8.1" >> "$GITHUB_PATH"
+          git lfs version
+      - run: go test -race -timeout 3m -tags=lfsintegration -run '^TestLFSIntegration' ./...
+
+
   binaries:
     runs-on: ubuntu-latest
     strategy:

@@ -891,24 +891,6 @@ func jsonBody(v any) io.Reader {
 	return &b
 }
 
-func (r *replicator) command(dir string, s side, name string, args ...string) error {
-	ctx, cancel := context.WithTimeout(r.ctx, r.timeout)
-	defer cancel()
-
-	cmd := r.gitCommand(ctx, s.token, name, args...)
-	cmd.Dir = dir
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	if err := cmd.Run(); err != nil {
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return fmt.Errorf("%s timed out after %s", name, r.timeout)
-		}
-		return fmt.Errorf("%s: %w", name, err)
-	}
-	return nil
-}
-
 // Validate downloaded bytes before deleting an existing destination asset.
 func verifyAsset(file *os.File, a asset) (string, error) {
 	info, err := file.Stat()

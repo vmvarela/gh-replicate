@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -48,32 +49,6 @@ func uniqueTags(releases []release) error {
 		seen[r.TagName] = true
 	}
 	return nil
-}
-
-// Configuration applies only to this child process. Never write ~/.gitconfig.
-func gitCommand(ctx context.Context, token, name string, args ...string) *exec.Cmd {
-	if name == "git" {
-		args = append([]string{"-c", "credential.helper=", "-c", "credential.https://github.com.helper=!gh auth git-credential", "-c", "http.https://github.com/.extraheader="}, args...)
-	}
-	cmd := exec.CommandContext(ctx, name, args...) // #nosec G204 -- all production callers pass the literal "git"; args go directly to argv with no shell
-	cmd.Env = gitEnv(token)
-	return cmd
-}
-
-// A side's token must replace the inherited one: duplicate entries are
-// resolved inconsistently by credential helpers.
-func gitEnv(token string) []string {
-	env := make([]string, 0, len(os.Environ())+2)
-	for _, entry := range os.Environ() {
-		if strings.HasPrefix(entry, "GH_TOKEN=") || strings.HasPrefix(entry, "GITHUB_TOKEN=") {
-			continue
-		}
-		env = append(env, entry)
-	}
-	if token != "" {
-		env = append(env, "GH_TOKEN="+token)
-	}
-	return append(env, "GIT_TERMINAL_PROMPT=0")
 }
 
 // tokenForAccount reads a token the user already stored for that account; it
@@ -177,12 +152,47 @@ type gitRef struct{ Name, ID string }
 
 var gitObjectIDRE = regexp.MustCompile(`\A([0-9a-f]{40}|[0-9a-f]{64})\z`)
 
+// localGitEnv is a minimal environment for local-only git commands (no network
+// or credentials), isolated from inherited config and GIT_* overrides so the
+// user's or parent's configuration cannot change what the scan reads.
+func localGitEnv() []string {
+	env := []string{
+		"HOME=" + os.TempDir(),
+		"XDG_CONFIG_HOME=" + filepath.Join(os.TempDir(), "gh-replicate-xdg"),
+		"PATH=" + os.Getenv("PATH"),
+		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_CONFIG_GLOBAL=" + os.DevNull,
+		"GIT_TERMINAL_PROMPT=0",
+		"GIT_ATTR_NOSYSTEM=1",
+		"LC_ALL=C",
+	}
+	if runtime.GOOS == "windows" {
+		for _, k := range []string{"SystemRoot", "ComSpec"} {
+			if v := os.Getenv(k); v != "" {
+				env = append(env, k+"="+v)
+			}
+		}
+	}
+	return env
+}
+
+// scanGitCommand builds a local-only git command with the cache lock inherited
+// and no inherited config, so the scan reads only the repository it is pointed at.
+func (r *replicator) scanGitCommand(ctx context.Context, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, "git", args...) // #nosec G204 -- fixed "git" binary, argv only
+	cmd.Env = localGitEnv()
+	if r.cacheLock != nil {
+		inheritCacheLock(cmd, r.cacheLock)
+	}
+	return cmd
+}
+
 // captureRefs records the names and object IDs of refs/heads and refs/tags once.
 // Call it under the caller's cache lock; later ref changes do not affect it.
 func (r *replicator) captureRefs(dir string) ([]gitRef, error) {
 	ctx, cancel := context.WithTimeout(r.ctx, r.timeout)
 	defer cancel()
-	cmd := r.gitCommand(ctx, "", "git", "--no-replace-objects", "for-each-ref", "--format=%(objectname) %(refname)", "refs/heads", "refs/tags")
+	cmd := r.scanGitCommand(ctx, "--no-replace-objects", "for-each-ref", "--format=%(objectname) %(refname)", "refs/heads", "refs/tags")
 	cmd.Dir = dir
 	out, err := cmd.Output()
 	if err != nil {
@@ -244,10 +254,10 @@ func (r *replicator) scanLFSBlobs(dir string, revs []string, revsIn io.Reader, v
 	ctx, cancel := context.WithTimeout(r.ctx, r.timeout)
 	defer cancel()
 	// --no-replace-objects: refs/replace in the cache must not hide what gets pushed.
-	reachable := r.gitCommand(ctx, "", "git", append([]string{"--no-replace-objects", "rev-list", "--objects", "--no-object-names"}, revs...)...)
+	reachable := r.scanGitCommand(ctx, append([]string{"--no-replace-objects", "rev-list", "--objects", "--no-object-names"}, revs...)...)
 	reachable.Stdin = revsIn
-	check := r.gitCommand(ctx, "", "git", "--no-replace-objects", "cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)")
-	read := r.gitCommand(ctx, "", "git", "--no-replace-objects", "cat-file", "--batch")
+	check := r.scanGitCommand(ctx, "--no-replace-objects", "cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)")
+	read := r.scanGitCommand(ctx, "--no-replace-objects", "cat-file", "--batch")
 	for _, cmd := range []*exec.Cmd{reachable, check, read} {
 		cmd.Dir = dir
 	}

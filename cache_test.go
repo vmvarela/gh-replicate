@@ -167,7 +167,12 @@ func TestCacheLockActiveChild(t *testing.T) {
 		r := &replicator{cacheLock: lock, ctx: context.Background(), timeout: 20 * time.Second}
 		// A real Git process must retain the lock while its command is active.
 		alias := `!"` + filepath.ToSlash(os.Args[0]) + `" -test.run=^TestCacheLockActiveChild$ cache-child`
-		if err := r.command(root, side{}, "git", "-c", "alias.cache-child="+alias, "cache-child"); err != nil {
+		cmd := r.scanGitCommand(context.Background(), "-c", "alias.cache-child="+alias, "cache-child")
+		cmd.Dir = root
+		cmd.Env = append(cmd.Env, "GH_REPLICATE_ACTIVE_CHILD="+root)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
 			t.Fatal(err)
 		}
 		return

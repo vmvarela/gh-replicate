@@ -156,16 +156,11 @@ func lfsSideEnv(root, token, path string) []string {
 	return env
 }
 
-// lfsStandaloneAgent is empty in production: GitHub uses basic HTTPS transfer.
-// Tests override it to "lfs-standalone-file" to exercise file:// remotes locally.
-var lfsStandaloneAgent = ""
-
 // lfsCmd builds a git command in the aux bare for one side, with the side's
 // isolated environment, its LFS endpoint pinned and the cache lock inherited.
 func (r *replicator) lfsCmd(ctx context.Context, a *lfsAux, s side, ownerRepo string, args ...string) *exec.Cmd {
 	full := append([]string{"-c", "credential.helper=", "-c", "credential.https://github.com.helper=!gh auth git-credential",
-		"-c", "lfs.url=" + lfsEndpoint(ownerRepo), "-c", "lfs.pushurl=" + lfsEndpoint(ownerRepo),
-		"-c", "lfs.standalonetransferagent=" + lfsStandaloneAgent}, args...)
+		"-c", "lfs.url=" + lfsEndpoint(ownerRepo), "-c", "lfs.pushurl=" + lfsEndpoint(ownerRepo)}, args...)
 	cmd := newLFSCmd(ctx, a.git, full...) // #nosec G204 -- resolved git binary, argv only
 	cmd.Dir = a.Dir
 	cmd.Env = lfsSideEnv(a.root, s.token, os.Getenv("PATH"))

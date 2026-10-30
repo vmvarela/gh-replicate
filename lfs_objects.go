@@ -47,7 +47,7 @@ func verifyLFSObject(ctx context.Context, path, oid string, size int64) error {
 	if fi.Size() != size {
 		return fmt.Errorf("Git LFS object %s has size %d, expected %d", oid, fi.Size(), size)
 	}
-	f, err := os.Open(path)
+	f, err := os.Open(path) // #nosec G304 -- path is built from a validated lowercase 64-hex OID under the controlled LFS root
 	if err != nil {
 		return fmt.Errorf("Git LFS object %s: %w", oid, err)
 	}
