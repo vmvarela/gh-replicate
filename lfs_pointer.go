@@ -68,6 +68,23 @@ func classifyLFSBlob(prefix []byte, blobSize int64) (p lfsPointer, found bool, b
 	return p, true, ""
 }
 
+// isLFSPointer conservatively matches any whole line (surrounding whitespace and
+// CRLF ignored, so extension lines before "version" are tolerated) naming a
+// known version alias. It is the pre-filter for classifyLFSBlob: a blob with no
+// alias is immediately "none".
+// shortcut: only the three aliases Git LFS 3.8.1 accepts, not future versions; upgrade when LFS adds one.
+func isLFSPointer(data []byte) bool {
+	for _, line := range bytes.Split(data, []byte("\n")) {
+		switch string(bytes.TrimSpace(line)) {
+		case "version https://git-lfs.github.com/spec/v1",
+			"version https://hawser.github.com/spec/v1",
+			"version http://git-media.io/v/2":
+			return true
+		}
+	}
+	return false
+}
+
 // hasFutureLFSVersion detects a recognizable future Git LFS version line so a
 // newer pointer blocks instead of being mistaken for ordinary content.
 func hasFutureLFSVersion(prefix []byte) bool {
