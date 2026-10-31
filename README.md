@@ -7,7 +7,7 @@ Use it to keep a mirror, a staging copy or a public fork in sync with a reposito
 ## What it copies
 
 - Branches and tags. Matching destination refs are overwritten; destination-only refs are kept.
-- Git LFS objects referenced by canonical spec-v1 pointers (see Limits).
+- Git LFS objects referenced by spec-v1 pointers (see Limits).
 - Releases, their uploaded assets and the Latest selection.
 - Description, homepage and topics.
 - Labels.
@@ -84,7 +84,7 @@ Both flags are optional and independent; without them the active account is used
 
 - **Check the direction.** Source wins for matching refs. A dry run reports what would change; it does not guarantee that server-side protections will accept the push.
 - **Ref renames can be blocked.** Replacing `release` with `release/v2` fails while `release` still exists in the destination, because destination-only refs are never deleted. Delete or rename it, then rerun.
-- **Git LFS support is limited to canonical spec-v1 pointers.** Objects referenced by a canonical pointer (`version https://git-lfs.github.com/spec/v1`, exactly three LF lines, no extensions, smaller than 1024 bytes) are downloaded, verified and uploaded before any ref is published, using `git-lfs` 3.8.1 or newer. Anything else that looks like LFS — older version aliases, CRLF, padding, extensions, or versions it does not recognize — stops the run before any destination change, including pointers only in history. The scan reads every blob reachable from branches and tags, so it can be slow on large histories (raise `--timeout`), and it is conservative: an ordinary file containing a known LFS version line may be reported too.
+- **Git LFS support covers spec-v1 pointers smaller than 1024 bytes.** Their objects are downloaded, verified and uploaded before any ref is published, using `git-lfs` 3.8.1 or newer. The three historical version aliases (`git-lfs`, `hawser`, `git-media`), CRLF line endings, surrounding whitespace, blank lines and `ext-*` extensions are accepted. Pointers 1024 bytes or larger (padded), a zero or malformed size, an unknown key, or a version it does not recognize stop the run before any destination change, including pointers only in history. The scan reads every blob reachable from branches and tags, so it can be slow on large histories (raise `--timeout`), and it is conservative: an ordinary file containing a known LFS version line may be reported too.
 - **Some assets need a second step.** A changed release asset is uploaded under a temporary name, verified, then swapped in, so its name is briefly missing. An interrupted run leaves either the previous asset or the verified replacement; a rerun finishes the work, and a leftover temporary asset may need deleting from the release.
 - **Invalid input stops the run before any write.** More than 20 topics, an empty release tag or a duplicated release tag, including drafts, abort the replication. Releases are matched by tag.
 - **Retries are bounded.** Read requests retry twice for selected transient failures and short rate limits; write requests are never replayed automatically, so rerun instead.
