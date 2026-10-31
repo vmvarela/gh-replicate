@@ -8,6 +8,17 @@ version-resolver:
     labels: [bug, documentation]
   default: patch
 
+autolabeler:
+  - label: 'enhancement'
+    title:
+      - '/^feat(\(.*\))?:/i'
+  - label: 'bug'
+    title:
+      - '/^fix(\(.*\))?:/i'
+  - label: 'documentation'
+    title:
+      - '/^docs(\(.*\))?:/i'
+
 categories:
   - title: Added
     labels: [enhancement]
