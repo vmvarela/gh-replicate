@@ -40,15 +40,14 @@ func lfsCases() []lfsCase {
 		{name: "leading whitespace", data: " \n\t" + long, found: true},
 		{name: "no trailing newline", data: strings.TrimSuffix(long, "\n"), found: true},
 		{name: "padded 1023", data: pad(long, 1023), found: true},
-		{name: "padded 1024", data: pad(long, 1024), blocked: true},
-		{name: "padded 1025", data: pad(long, 1025), blocked: true},
-		{name: "padded 2127", data: pad(long, 2127), blocked: true},
+		{name: "padded 1024", data: pad(long, 1024), found: true},
+		{name: "padded 1025", data: pad(long, 1025), found: true},
+		{name: "padded 2127", data: pad(long, 2127), found: true},
 		{name: "blank lines between", data: "version " + ptrV1 + "\n\n" + ptrBody, found: true},
 		{name: "extension", data: "version " + ptrV1 + "\next-0-foo " + ptrOID + "\n" + ptrBody, found: true},
 		{name: "extension before version", data: "ext-0-foo " + ptrOID + "\n" + long, found: true},
 		{name: "swapped order", data: "version " + ptrV1 + "\nsize 12345\noid " + ptrOID + "\n", blocked: true},
 		{name: "missing size", data: "version " + ptrV1 + "\noid " + ptrOID + "\n", blocked: true},
-		{name: "zero size", data: "version " + ptrV1 + "\noid " + ptrOID + "\nsize 0\n", blocked: true},
 		{name: "plus size", data: "version " + ptrV1 + "\noid " + ptrOID + "\nsize +5\n", blocked: true},
 		{name: "leading zero size", data: "version " + ptrV1 + "\noid " + ptrOID + "\nsize 05\n", blocked: true},
 		{name: "overflow size", data: "version " + ptrV1 + "\noid " + ptrOID + "\nsize 9223372036854775808\n", blocked: true},
@@ -79,6 +78,15 @@ func TestLFSClassifyBlob(t *testing.T) {
 				t.Fatalf("pointer = %+v", p)
 			}
 		})
+	}
+}
+
+// A size-0 pointer names an empty object; git-lfs stores nothing for it, so it
+// is classified as "none" (nothing to transfer) rather than blocked.
+func TestLFSClassifyZeroSizeNone(t *testing.T) {
+	data := "version " + ptrV1 + "\noid " + ptrOID + "\nsize 0\n"
+	if _, found, blocked := classifyCase(data); found || blocked != "" {
+		t.Fatalf("found=%v blocked=%q, want none", found, blocked)
 	}
 }
 
@@ -156,7 +164,8 @@ func invNow(r *replicator, dir string) (lfsInventory, error) {
 	if err != nil {
 		return nil, err
 	}
-	return r.inventoryLFS(dir, refs)
+	inv, _, err := r.inventoryLFS(dir, refs)
+	return inv, err
 }
 
 func lfsPtr(c byte, size string) []byte {
@@ -227,16 +236,27 @@ func TestLFSInventoryCheckBlocksAmbiguous(t *testing.T) {
 	}
 }
 
-func TestLFSInventoryRejectsUnsupportedHistoricalPointer(t *testing.T) {
+func TestLFSInventoryIncludesOversizedHistoricalPointer(t *testing.T) {
 	dir := lfsWorkRepo(t, map[string][]byte{
 		"valid": lfsPtr('a', "10"),
 		"old":   []byte(pad(string(lfsPtr('b', "20")), 1024)),
 	})
 	gitTest(t, dir, "rm", "-q", "old")
-	gitTest(t, dir, "commit", "-m", "remove unsupported pointer")
+	gitTest(t, dir, "commit", "-m", "remove oversized pointer")
 	r := &replicator{ctx: context.Background(), timeout: time.Minute}
-	if inv, err := invNow(r, dir); err == nil || inv != nil {
-		t.Fatalf("inventory = %v, err = %v", inv, err)
+	refs, err := r.captureRefs(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inv, big, err := r.inventoryLFS(dir, refs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inv[strings.Repeat("a", 64)] != 10 || inv[strings.Repeat("b", 64)] != 20 || len(inv) != 2 {
+		t.Fatalf("inventory = %v", inv)
+	}
+	if !big[strings.Repeat("b", 64)] || big[strings.Repeat("a", 64)] {
+		t.Fatalf("big = %v, want only the oversized pointer", big)
 	}
 }
 
@@ -285,7 +305,7 @@ func TestLFSInventoryUsesCapturedRefsOnly(t *testing.T) {
 	gitTest(t, dir, "add", ".")
 	gitTest(t, dir, "commit", "-m", "later")
 	gitTest(t, dir, "update-ref", "refs/tags/later", lfsBlob(t, dir, lfsPtr('d', "40")))
-	inv, err := r.inventoryLFS(dir, refs)
+	inv, _, err := r.inventoryLFS(dir, refs)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -306,7 +326,7 @@ func TestLFSInventoryEmptyCaptureIsEmpty(t *testing.T) {
 	// Pointer created after the empty capture must not appear ("--all" would find it).
 	gitTest(t, dir, "update-ref", "refs/tags/late", lfsBlob(t, dir, lfsPtr('a', "10")))
 	gitTest(t, dir, "update-ref", "refs/notes/x", lfsBlob(t, dir, lfsPtr('b', "10")))
-	inv, err := r.inventoryLFS(dir, refs)
+	inv, _, err := r.inventoryLFS(dir, refs)
 	if err != nil || inv == nil || len(inv) != 0 {
 		t.Fatalf("inventory = %v, err = %v", inv, err)
 	}
@@ -327,7 +347,7 @@ func TestLFSCaptureRefsErrors(t *testing.T) {
 	// Captured tips that no longer exist make the scan fail, never pass silently.
 	r.ctx = context.Background()
 	bad := []gitRef{{Name: "refs/heads/x", ID: strings.Repeat("1", 40)}}
-	if inv, err := r.inventoryLFS(dir, bad); err == nil || inv != nil {
+	if inv, _, err := r.inventoryLFS(dir, bad); err == nil || inv != nil {
 		t.Fatalf("inventory = %v, err = %v", inv, err)
 	}
 }
@@ -338,7 +358,7 @@ func TestLFSInventoryCanceledEmptyCapture(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	r := &replicator{ctx: ctx, timeout: time.Minute}
-	if inv, err := r.inventoryLFS(dir, nil); err == nil || inv != nil {
+	if inv, _, err := r.inventoryLFS(dir, nil); err == nil || inv != nil {
 		t.Fatalf("inventory = %v, err = %v", inv, err)
 	}
 }
@@ -348,7 +368,7 @@ func TestLFSInventoryRejectsGraftEnv(t *testing.T) {
 	gitTest(t, dir, "init", "--bare")
 	t.Setenv("GIT_GRAFT_FILE", "ignored")
 	r := &replicator{ctx: context.Background(), timeout: time.Minute}
-	if _, err := r.inventoryLFS(dir, nil); err == nil || !strings.Contains(err.Error(), "GIT_GRAFT_FILE") {
+	if _, _, err := r.inventoryLFS(dir, nil); err == nil || !strings.Contains(err.Error(), "GIT_GRAFT_FILE") {
 		t.Fatalf("err = %v", err)
 	}
 	if err := r.checkLFS(dir); err == nil || !strings.Contains(err.Error(), "GIT_GRAFT_FILE") {
@@ -363,7 +383,7 @@ func TestLFSInventoryRejectsShallowFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := &replicator{ctx: context.Background(), timeout: time.Minute}
-	if inv, err := r.inventoryLFS(dir, nil); err == nil || inv != nil || !strings.Contains(err.Error(), "shallow") {
+	if inv, _, err := r.inventoryLFS(dir, nil); err == nil || inv != nil || !strings.Contains(err.Error(), "shallow") {
 		t.Fatalf("inventory = %v, err = %v", inv, err)
 	}
 	if err := r.checkLFS(dir); err == nil || !strings.Contains(err.Error(), "shallow") {

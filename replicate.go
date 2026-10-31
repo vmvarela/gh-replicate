@@ -460,7 +460,7 @@ func (r *replicator) syncGit(source, target string) error {
 	if err != nil {
 		return err
 	}
-	inv, err := r.inventoryLFS(aux.Dir, refs)
+	inv, big, err := r.inventoryLFS(aux.Dir, refs)
 	if err != nil {
 		return err
 	}
@@ -477,7 +477,7 @@ func (r *replicator) syncGit(source, target string) error {
 		}
 		if r.dryRun {
 			fmt.Fprintf(os.Stderr, "  Would transfer %d Git LFS objects from %s to %s\n", len(inv), source, target)
-		} else if err := r.transferLFS(r.ctx, aux, source, target, refs, inv); err != nil {
+		} else if err := r.transferLFS(r.ctx, aux, source, target, refs, inv, big); err != nil {
 			return err
 		}
 	}

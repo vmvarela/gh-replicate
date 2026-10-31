@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -55,7 +56,10 @@ func (r *replicator) requireLFS(ctx context.Context, a *lfsAux, s side, ownerRep
 
 // transferLFS downloads every inventory object from the source, verifies its
 // size and SHA-256, then uploads to the destination, all before any ref push.
-func (r *replicator) transferLFS(ctx context.Context, a *lfsAux, source, target string, refs []gitRef, inv lfsInventory) error {
+// Pointers the CLI scanner finds (<1024 bytes) transfer by ref; oversized
+// (>=1024 bytes) pointers transfer by materialized canonical pointer and
+// --object-id, because the scanner rejects blobs at or above that size.
+func (r *replicator) transferLFS(ctx context.Context, a *lfsAux, source, target string, refs []gitRef, inv lfsInventory, big map[string]bool) error {
 	var names strings.Builder
 	for _, ref := range refs {
 		names.WriteString(ref.Name + "\n")
@@ -64,11 +68,30 @@ func (r *replicator) transferLFS(ctx context.Context, a *lfsAux, source, target 
 	if err := r.lfsRunIn(ctx, a, r.source, source, refsIn, "lfs", "fetch", "--all", "--stdin"); err != nil {
 		return fmt.Errorf("download Git LFS objects from source: %w", err)
 	}
+	if len(big) > 0 {
+		blobs, err := a.writePointers(ctx, inv, big)
+		if err != nil {
+			return fmt.Errorf("materialize oversized Git LFS pointers: %w", err)
+		}
+		if err := r.lfsRunIn(ctx, a, r.source, source, strings.Join(blobs, "\n")+"\n", "lfs", "fetch", "--all", "--stdin"); err != nil {
+			return fmt.Errorf("download oversized Git LFS objects from source: %w", err)
+		}
+	}
 	if err := verifyLFSObjects(ctx, filepath.Join(a.Dir, "lfs"), inv); err != nil {
 		return fmt.Errorf("verify downloaded Git LFS objects: %w", err)
 	}
 	if err := r.lfsRunIn(ctx, a, r.target, target, refsIn, "lfs", "push", "--all", "--stdin", "replicate-target"); err != nil {
 		return fmt.Errorf("upload Git LFS objects to target: %w", err)
+	}
+	if len(big) > 0 {
+		var oids []string
+		for oid := range big {
+			oids = append(oids, oid)
+		}
+		sort.Strings(oids)
+		if err := r.lfsRunIn(ctx, a, r.target, target, strings.Join(oids, "\n")+"\n", "lfs", "push", "--object-id", "--stdin", "replicate-target"); err != nil {
+			return fmt.Errorf("upload oversized Git LFS objects to target: %w", err)
+		}
 	}
 	return nil
 }

@@ -459,8 +459,8 @@ func TestLFSSyncGitBlocksHistoricalPointerBeforeDestinationEffects(t *testing.T)
 	gitTest(t, filepath.Dir(work), "clone", f.source, work)
 	gitTest(t, work, "config", "user.name", "Test")
 	gitTest(t, work, "config", "user.email", "test@example.com")
-	pointer := "version https://hawser.github.com/spec/v1\r\noid sha256:" + strings.Repeat("a", 64) + "\r\nsize 12\r\n"
-	pointer += strings.Repeat("\n", 2127-len(pointer)) // padded beyond the 1024-byte prefix
+	pointer := "version https://git-lfs.github.com/spec/v2\r\noid sha256:" + strings.Repeat("a", 64) + "\r\nsize 12\r\n"
+	pointer += strings.Repeat("\n", 2127-len(pointer)) // a future version: still blocked
 	if err := os.WriteFile(filepath.Join(work, "big.bin"), []byte(pointer), 0o644); err != nil {
 		t.Fatal(err)
 	}

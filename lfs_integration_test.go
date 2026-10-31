@@ -234,14 +234,14 @@ func TestLFSIntegrationTransfer(t *testing.T) {
 		"file://"+srcBare, "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"))
 	refs, err := r.captureRefs(a.Dir)
 	must(t, err)
-	inv, err := r.inventoryLFS(a.Dir, refs)
+	inv, _, err := r.inventoryLFS(a.Dir, refs)
 	must(t, err)
 	if len(inv) != 2 {
 		t.Fatalf("inventory has %d objects, want 2", len(inv))
 	}
 	must(t, a.pointHEADAbsent(context.Background()))
 
-	must(t, r.transferLFS(context.Background(), a, "src", "dst", refs, inv))
+	must(t, r.transferLFS(context.Background(), a, "src", "dst", refs, inv, nil))
 
 	for _, oid := range []string{oid1, oid2} {
 		if !dstStore.has(oid) {
@@ -303,14 +303,14 @@ func TestLFSIntegrationPartialUploadFails(t *testing.T) {
 		"file://"+srcBare, "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"))
 	refs, err := r.captureRefs(a.Dir)
 	must(t, err)
-	inv, err := r.inventoryLFS(a.Dir, refs)
+	inv, _, err := r.inventoryLFS(a.Dir, refs)
 	must(t, err)
 	if len(inv) != 2 {
 		t.Fatalf("inventory has %d objects, want 2", len(inv))
 	}
 	must(t, a.pointHEADAbsent(context.Background()))
 
-	err = r.transferLFS(context.Background(), a, "src", "dst", refs, inv)
+	err = r.transferLFS(context.Background(), a, "src", "dst", refs, inv, nil)
 	if err == nil || !strings.Contains(err.Error(), "upload Git LFS objects") {
 		t.Fatalf("error = %v, want upload failure", err)
 	}
@@ -322,6 +322,65 @@ func TestLFSIntegrationPartialUploadFails(t *testing.T) {
 	}
 	if dstStore.has(oid2) {
 		t.Fatal("failed object was stored despite the injected failure")
+	}
+}
+
+// TestLFSIntegrationOversizedPointer transfers a >=1024-byte padded pointer
+// through the materialized-canonical-pointer route, which the CLI scanner's
+// ref-based fetch misses.
+func TestLFSIntegrationOversizedPointer(t *testing.T) {
+	if _, err := exec.LookPath("git-lfs"); err != nil {
+		t.Fatalf("git-lfs is required for -tags=lfsintegration: %v", err)
+	}
+	content := []byte("oversized lfs object\n")
+	oid := sha256hex(content)
+
+	src, srcStore := newLFSServer(t)
+	dst, dstStore := newLFSServer(t)
+	srcStore.add(oid, content)
+
+	srcBare := filepath.Join(t.TempDir(), "src.git")
+	gitTest(t, t.TempDir(), "init", "--bare", srcBare)
+	work := t.TempDir()
+	gitTest(t, work, "init", "-b", "main")
+	gitTest(t, work, "config", "user.name", "Test")
+	gitTest(t, work, "config", "user.email", "test@example.com")
+	padded := canonicalPointer(oid, int64(len(content))) + strings.Repeat(" ", 1024)
+	must(t, os.WriteFile(filepath.Join(work, "a.bin"), []byte(padded), 0o644))
+	gitTest(t, work, "add", ".")
+	gitTest(t, work, "commit", "-m", "padded pointer")
+	gitTest(t, work, "push", "file://"+srcBare, "refs/heads/main:refs/heads/main")
+
+	prev := gitRemote
+	gitRemote = func(ownerRepo string) string {
+		if ownerRepo == "dst" {
+			return dst.URL
+		}
+		return src.URL
+	}
+	defer func() { gitRemote = prev }()
+
+	a := newAux(t)
+	r := &replicator{ctx: context.Background(), timeout: time.Minute, source: side{}, target: side{}}
+	must(t, a.run(context.Background(), "--git-dir="+a.Dir, "config", "remote.replicate-target.url", dst.URL))
+	must(t, a.run(context.Background(), "--git-dir="+a.Dir, "fetch", "--prune", "--no-tags",
+		"file://"+srcBare, "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"))
+	refs, err := r.captureRefs(a.Dir)
+	must(t, err)
+	inv, big, err := r.inventoryLFS(a.Dir, refs)
+	must(t, err)
+	if len(inv) != 1 || inv[oid] != int64(len(content)) || !big[oid] {
+		t.Fatalf("inventory = %v big = %v", inv, big)
+	}
+	must(t, a.pointHEADAbsent(context.Background()))
+
+	must(t, r.transferLFS(context.Background(), a, "src", "dst", refs, inv, big))
+
+	if !dstStore.has(oid) {
+		t.Fatal("destination missing the oversized LFS object")
+	}
+	if !bytes.Equal(dstStore.get(oid), content) {
+		t.Fatal("destination object bytes differ")
 	}
 }
 
