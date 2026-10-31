@@ -34,18 +34,18 @@ func lfsCases() []lfsCase {
 	long := "version " + ptrV1 + "\n" + ptrBody
 	return []lfsCase{
 		{name: "lfs", data: long, found: true},
-		{name: "hawser", data: "version " + hawser + "\n" + ptrBody, blocked: true},
-		{name: "git-media", data: "version " + media + "\n" + ptrBody, blocked: true},
-		{name: "crlf", data: crlf(long), blocked: true},
-		{name: "leading whitespace", data: " \n\t" + long, blocked: true},
-		{name: "no trailing newline", data: strings.TrimSuffix(long, "\n"), blocked: true},
-		{name: "padded 1023", data: pad(long, 1023), blocked: true},
+		{name: "hawser", data: "version " + hawser + "\n" + ptrBody, found: true},
+		{name: "git-media", data: "version " + media + "\n" + ptrBody, found: true},
+		{name: "crlf", data: crlf(long), found: true},
+		{name: "leading whitespace", data: " \n\t" + long, found: true},
+		{name: "no trailing newline", data: strings.TrimSuffix(long, "\n"), found: true},
+		{name: "padded 1023", data: pad(long, 1023), found: true},
 		{name: "padded 1024", data: pad(long, 1024), blocked: true},
 		{name: "padded 1025", data: pad(long, 1025), blocked: true},
 		{name: "padded 2127", data: pad(long, 2127), blocked: true},
-		{name: "blank lines between", data: "version " + ptrV1 + "\n\n" + ptrBody, blocked: true},
-		{name: "extension", data: "version " + ptrV1 + "\next-0-foo " + ptrOID + "\n" + ptrBody, blocked: true},
-		{name: "extension before version", data: "ext-0-foo " + ptrOID + "\n" + long, blocked: true},
+		{name: "blank lines between", data: "version " + ptrV1 + "\n\n" + ptrBody, found: true},
+		{name: "extension", data: "version " + ptrV1 + "\next-0-foo " + ptrOID + "\n" + ptrBody, found: true},
+		{name: "extension before version", data: "ext-0-foo " + ptrOID + "\n" + long, found: true},
 		{name: "swapped order", data: "version " + ptrV1 + "\nsize 12345\noid " + ptrOID + "\n", blocked: true},
 		{name: "missing size", data: "version " + ptrV1 + "\noid " + ptrOID + "\n", blocked: true},
 		{name: "zero size", data: "version " + ptrV1 + "\noid " + ptrOID + "\nsize 0\n", blocked: true},
@@ -203,10 +203,10 @@ func TestLFSInventoryHistoryTagsAndObsolete(t *testing.T) {
 func TestLFSInventoryFailsClosed(t *testing.T) {
 	r := &replicator{ctx: context.Background(), timeout: time.Minute}
 	conflict := lfsWorkRepo(t, map[string][]byte{"x": lfsPtr('a', "10"), "y": lfsPtr('a', "11")})
-	ext := lfsWorkRepo(t, map[string][]byte{"x": []byte("version " + ptrV1 + "\next-0-foo " + ptrOID + "\n" + ptrBody)})
+	upper := lfsWorkRepo(t, map[string][]byte{"x": []byte("version " + ptrV1 + "\noid sha256:" + strings.ToUpper(ptrHex) + "\nsize 5\n")})
 	for name, c := range map[string]struct{ dir, want string }{
 		"conflicting sizes": {conflict, "conflicting Git LFS sizes"},
-		"extension":         {ext, "unsupported or noncanonical"},
+		"uppercase oid":     {upper, "invalid Git LFS pointer object id"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			inv, err := invNow(r, c.dir)
