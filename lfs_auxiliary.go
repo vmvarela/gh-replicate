@@ -8,6 +8,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -121,6 +123,38 @@ func (a *lfsAux) pointHEADAbsent(ctx context.Context) error {
 		return nil
 	}
 	return fmt.Errorf("verify ephemeral HEAD is absent: %w", err)
+}
+
+// writePointers materializes one canonical pointer blob per OID in big (sorted)
+// and returns each blob's SHA-1 in the same order, so the transfer path can feed
+// `git lfs fetch --all --stdin <blob SHAs>`. It is used only for >=1024-byte
+// pointers the CLI scanner cannot find; these are rare, so one hash-object per
+// object is fine.
+func (a *lfsAux) writePointers(ctx context.Context, inv lfsInventory, big map[string]bool) ([]string, error) {
+	var oids []string
+	for oid := range big {
+		if inv[oid] > 0 {
+			oids = append(oids, oid)
+		}
+	}
+	sort.Strings(oids)
+	blobs := make([]string, 0, len(oids))
+	for _, oid := range oids {
+		ptr := "version https://git-lfs.github.com/spec/v1\noid sha256:" + oid + "\nsize " + strconv.FormatInt(inv[oid], 10) + "\n"
+		cmd := exec.CommandContext(ctx, a.git, "--git-dir="+a.Dir, "hash-object", "-w", "--stdin") // #nosec G204 -- resolved git binary, argv only
+		cmd.Dir, cmd.Env = a.root, a.env
+		cmd.Stdin = strings.NewReader(ptr)
+		out, err := cmd.Output()
+		if err != nil {
+			return nil, fmt.Errorf("hash-object pointer %s: %w", oid, err)
+		}
+		sha := strings.TrimSpace(string(out))
+		if !gitObjectIDRE.MatchString(sha) {
+			return nil, fmt.Errorf("unexpected hash-object output %q", out)
+		}
+		blobs = append(blobs, sha)
+	}
+	return blobs, nil
 }
 
 // lfsEndpoint is the GitHub LFS API URL for a repo's HTTPS remote. It is a var

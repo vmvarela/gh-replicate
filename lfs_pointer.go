@@ -37,15 +37,18 @@ var lfsPointerKeys = [3]string{"version", "oid", "size"}
 
 // classifyLFSBlob inspects the first min(blobSize, 1024) bytes of a non-empty
 // blob, passed as prefix. Results:
-//   - none: no known version alias or recognizable Git LFS version line.
-//   - confirmed: a Git LFS pointer the transfer path copies (any 3.8.1 alias,
-//     CRLF, surrounding whitespace, blank lines and extensions, canonical size).
+//   - none: no known version alias or recognizable Git LFS version line, or a
+//     size-0 pointer (empty object; git-lfs stores nothing for it).
+//   - confirmed: a Git LFS pointer whose object the transfer path copies (any
+//     3.8.1 alias, CRLF, surrounding whitespace, blank lines and extensions, a
+//     positive canonical size, any blob length).
 //   - blocked: a candidate outside the supported subset; callers must stop.
 //
-// It mirrors Git LFS 3.8.1 pointer.DecodeFrom/decodeKV for everything the
-// transfer path copies; oversized (>=1024 bytes) and zero/non-canonical sizes
-// stay blocked because the CLI scanner cannot transfer them. Unknown future
-// formats cannot be detected universally. Callers skip empty blobs.
+// It mirrors Git LFS 3.8.1 pointer.DecodeFrom/decodeKV. Oversized (>=1024
+// bytes) padded pointers decode from their first 1024 bytes and transfer via a
+// separate path, because the CLI scanner's DecodePointerFromBlob rejects them.
+// Unknown future formats cannot be detected universally. Callers skip empty
+// blobs.
 func classifyLFSBlob(prefix []byte, blobSize int64) (p lfsPointer, found bool, blocked string) {
 	// Fail closed first: "none" is only valid for the complete committed prefix.
 	if blobSize <= 0 || int64(len(prefix)) != min(blobSize, lfsPrefixSize) {
@@ -54,12 +57,13 @@ func classifyLFSBlob(prefix []byte, blobSize int64) (p lfsPointer, found bool, b
 	if !isLFSPointer(prefix) && !hasFutureLFSVersion(prefix) {
 		return lfsPointer{}, false, ""
 	}
-	if blobSize >= lfsPrefixSize {
-		return p, false, "Git LFS pointer is too large for the supported format"
-	}
 	p, err := decodeLFSKV(bytes.TrimSpace(prefix))
 	if err != nil {
 		return lfsPointer{}, false, err.Error()
+	}
+	if p.Size == 0 {
+		// Empty object: git-lfs never stores one ("empty files are special").
+		return lfsPointer{}, false, ""
 	}
 	return p, true, ""
 }
@@ -117,7 +121,7 @@ func decodeLFSKV(data []byte) (lfsPointer, error) {
 	}
 	sizeText, ok := kvps["size"]
 	size, err := strconv.ParseInt(sizeText, 10, 64)
-	if !ok || err != nil || size <= 0 || strconv.FormatInt(size, 10) != sizeText {
+	if !ok || err != nil || size < 0 || strconv.FormatInt(size, 10) != sizeText {
 		return lfsPointer{}, errors.New("invalid Git LFS pointer size")
 	}
 	return lfsPointer{OID: strings.TrimPrefix(oid, "sha256:"), Size: size}, nil

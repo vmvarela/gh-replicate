@@ -213,17 +213,20 @@ func (r *replicator) captureRefs(dir string) ([]gitRef, error) {
 }
 
 // inventoryLFS maps OID to size for every pointer reachable from the captured
-// refs only (later ref changes are ignored). An empty capture is an empty
-// inventory, never "all refs". It fails closed: the first ambiguous candidate
-// or conflicting size aborts with an error naming the blob, and no inventory is
-// returned. A valid inventory visits every blob.
-func (r *replicator) inventoryLFS(dir string, refs []gitRef) (lfsInventory, error) {
+// refs only (later ref changes are ignored), and returns the OIDs whose blob is
+// >=1024 bytes (padded), which the CLI scanner misses and so need a separate
+// transfer route. An empty capture is an empty inventory, never "all refs". It
+// fails closed: the first ambiguous candidate or conflicting size aborts with an
+// error naming the blob, and no inventory is returned. A valid inventory visits
+// every blob.
+func (r *replicator) inventoryLFS(dir string, refs []gitRef) (lfsInventory, map[string]bool, error) {
 	if err := r.guardLFSScan(dir); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	inv := lfsInventory{}
+	big := map[string]bool{}
 	if len(refs) == 0 {
-		return inv, nil
+		return inv, big, nil
 	}
 	var tips strings.Builder // via stdin: no argv limit
 	for _, ref := range refs {
@@ -238,13 +241,16 @@ func (r *replicator) inventoryLFS(dir string, refs []gitRef) (lfsInventory, erro
 			if err := inv.add(p); err != nil {
 				return fmt.Errorf("Git LFS blob %s: %w", blobID, err)
 			}
+			if size >= lfsPrefixSize {
+				big[p.OID] = true
+			}
 		}
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return inv, nil
+	return inv, big, nil
 }
 
 // scanLFSBlobs streams every non-empty blob reachable from the rev-list
