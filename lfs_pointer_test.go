@@ -206,7 +206,6 @@ func TestLFSInventoryHistoryTagsAndObsolete(t *testing.T) {
 			t.Fatalf("oid %s size = %d, want %d", oid, inv[oid], size)
 		}
 	}
-	wantLFS(t, r.checkLFS(dir))
 }
 
 func TestLFSInventoryFailsClosed(t *testing.T) {
@@ -222,7 +221,6 @@ func TestLFSInventoryFailsClosed(t *testing.T) {
 			if err == nil || inv != nil || !strings.Contains(err.Error(), c.want) || !strings.Contains(err.Error(), "Git LFS blob ") {
 				t.Fatalf("inventory = %v, err = %v", inv, err)
 			}
-			wantLFS(t, r.checkLFS(c.dir))
 		})
 	}
 }
@@ -230,7 +228,6 @@ func TestLFSInventoryFailsClosed(t *testing.T) {
 func TestLFSInventoryCheckBlocksAmbiguous(t *testing.T) {
 	dir := lfsWorkRepo(t, map[string][]byte{"x": []byte("version " + ptrV1 + "\nsize 5\noid " + ptrOID + "\n")})
 	r := &replicator{ctx: context.Background(), timeout: time.Minute}
-	wantLFS(t, r.checkLFS(dir))
 	if inv, err := invNow(r, dir); err == nil || inv != nil {
 		t.Fatalf("inventory = %v, err = %v", inv, err)
 	}
@@ -265,9 +262,6 @@ func TestLFSInventoryNoLFSAndErrors(t *testing.T) {
 	r := &replicator{ctx: context.Background(), timeout: time.Minute}
 	if inv, err := invNow(r, dir); err != nil || inv == nil || len(inv) != 0 {
 		t.Fatalf("inventory = %v, err = %v", inv, err)
-	}
-	if err := r.checkLFS(dir); err != nil {
-		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -371,9 +365,6 @@ func TestLFSInventoryRejectsGraftEnv(t *testing.T) {
 	if _, _, err := r.inventoryLFS(dir, nil); err == nil || !strings.Contains(err.Error(), "GIT_GRAFT_FILE") {
 		t.Fatalf("err = %v", err)
 	}
-	if err := r.checkLFS(dir); err == nil || !strings.Contains(err.Error(), "GIT_GRAFT_FILE") {
-		t.Fatalf("checkLFS err = %v", err)
-	}
 }
 
 func TestLFSInventoryRejectsShallowFile(t *testing.T) {
@@ -385,8 +376,5 @@ func TestLFSInventoryRejectsShallowFile(t *testing.T) {
 	r := &replicator{ctx: context.Background(), timeout: time.Minute}
 	if inv, _, err := r.inventoryLFS(dir, nil); err == nil || inv != nil || !strings.Contains(err.Error(), "shallow") {
 		t.Fatalf("inventory = %v, err = %v", inv, err)
-	}
-	if err := r.checkLFS(dir); err == nil || !strings.Contains(err.Error(), "shallow") {
-		t.Fatalf("checkLFS err = %v", err)
 	}
 }

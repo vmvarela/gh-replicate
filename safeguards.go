@@ -65,24 +65,6 @@ var tokenForAccount = func(login string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// isLFSPointer conservatively matches any whole line (surrounding whitespace and
-// CRLF ignored, so extension lines before "version" are tolerated) naming a
-// known version alias.
-// shortcut: only the three aliases Git LFS 3.8.1 accepts, not future versions; upgrade when LFS adds one.
-func isLFSPointer(data []byte) bool {
-	for _, line := range bytes.Split(data, []byte("\n")) {
-		switch string(bytes.TrimSpace(line)) {
-		case "version https://git-lfs.github.com/spec/v1",
-			"version https://hawser.github.com/spec/v1",
-			"version http://git-media.io/v/2":
-			return true
-		}
-	}
-	return false
-}
-
-var errLFSBlocked = errors.New("Git LFS pointers detected; LFS objects are not supported, so replication stopped before destination changes")
-
 // Git ancestry and repository-redirect overrides could make the scan read a
 // truncated or different history than the refs actually reference. Rejecting
 // is safer than silently stripping: a caller who needs these should get a
@@ -129,21 +111,6 @@ func (r *replicator) guardLFSScan(dir string) error {
 		return err
 	}
 	return verifyNoHistoryTruncation(dir)
-}
-
-// Detect LFS pointers reachable from the branches and tags being pushed,
-// including historical versions, but excluding obsolete cached objects.
-// Any line naming a known version alias blocks, confirmed pointer or not.
-func (r *replicator) checkLFS(dir string) error {
-	if err := r.guardLFSScan(dir); err != nil {
-		return err
-	}
-	return r.scanLFSBlobs(dir, []string{"--branches", "--tags"}, nil, func(_ string, _ int64, prefix []byte) error {
-		if isLFSPointer(prefix) {
-			return errLFSBlocked
-		}
-		return nil
-	})
 }
 
 // gitRef is a captured refs/heads or refs/tags entry; ID may name a commit, an

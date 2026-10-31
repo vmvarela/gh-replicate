@@ -132,13 +132,12 @@ func TestLFSHistoryAndObsoleteCache(t *testing.T) {
 	gitTest(t, dir, "commit", "-m", "LFS")
 	gitTest(t, dir, "rm", "pointer")
 	gitTest(t, dir, "commit", "-m", "remove file but retain history")
-	r := &replicator{ctx: context.Background(), timeout: time.Minute}
-	if err := r.checkLFS(dir); err == nil {
+	if inv := lfsScanInv(t, dir); len(inv) == 0 {
 		t.Fatal("historical LFS escaped detection")
 	}
 	gitTest(t, dir, "reset", "--hard", clean)
-	if err := r.checkLFS(dir); err != nil {
-		t.Fatal("obsolete objects blocked clean source", err)
+	if inv := lfsScanInv(t, dir); len(inv) != 0 {
+		t.Fatalf("obsolete objects inventoried on clean source: %v", inv)
 	}
 }
 
@@ -290,14 +289,13 @@ func TestLFSStreamingLargeListing(t *testing.T) {
 	}
 	gitTest(t, dir, "add", ".")
 	gitTest(t, dir, "commit", "-m", "more than a pipe buffer of objects")
-	r := &replicator{ctx: context.Background(), timeout: time.Minute}
-	if err := r.checkLFS(dir); err != nil {
-		t.Fatal(err)
+	if inv := lfsScanInv(t, dir); len(inv) != 0 {
+		t.Fatalf("inventory = %v, want empty", inv)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	r.ctx = ctx
-	if err := r.checkLFS(dir); err == nil {
+	r := &replicator{ctx: ctx, timeout: time.Minute}
+	if _, _, err := r.inventoryLFS(dir, nil); err == nil {
 		t.Fatal("cancelled scan succeeded")
 	}
 }

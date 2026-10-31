@@ -253,9 +253,8 @@ func gitTest(t *testing.T, dir string, args ...string) string {
 func TestLFSPointerDetection(t *testing.T) {
 	dir := t.TempDir()
 	gitTest(t, dir, "init", "--bare")
-	r := &replicator{ctx: context.Background(), timeout: time.Minute}
-	if err := r.checkLFS(dir); err != nil {
-		t.Fatal(err)
+	if inv := lfsScanInv(t, dir); len(inv) != 0 {
+		t.Fatalf("empty repo inventory = %v, want empty", inv)
 	}
 	cmd := exec.Command("git", "hash-object", "-w", "--stdin")
 	cmd.Dir = dir
@@ -264,53 +263,13 @@ func TestLFSPointerDetection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err, string(out))
 	}
-	// Unreachable cached pointers must not prevent replication.
-	if err := r.checkLFS(dir); err != nil {
-		t.Fatal(err)
+	// Unreachable cached pointers must not be inventoried.
+	if inv := lfsScanInv(t, dir); len(inv) != 0 {
+		t.Fatalf("unreachable pointer inventory = %v, want empty", inv)
 	}
 	gitTest(t, dir, "update-ref", "refs/tags/pointer", strings.TrimSpace(string(out)))
-	if err := r.checkLFS(dir); err == nil || !strings.Contains(err.Error(), "Git LFS") {
-		t.Fatal("missing LFS detection", err)
-	}
-}
-
-func TestLFSPointerVariants(t *testing.T) {
-	tail := "oid sha256:" + strings.Repeat("a", 64) + "\nsize 12\n"
-	cases := map[string]struct {
-		content string
-		want    bool
-	}{
-		"lfs":            {"version https://git-lfs.github.com/spec/v1\n" + tail, true},
-		"hawser":         {"version https://hawser.github.com/spec/v1\n" + tail, true},
-		"git-media":      {"version http://git-media.io/v/2\n" + tail, true},
-		"crlf":           {"version https://git-lfs.github.com/spec/v1\r\n" + strings.ReplaceAll(tail, "\n", "\r\n"), true},
-		"whitespace":     {"  \n  version https://hawser.github.com/spec/v1\n" + tail, true},
-		"extension":      {"ext-0-foo sha256:" + strings.Repeat("b", 64) + "\nversion https://git-lfs.github.com/spec/v1\n" + tail, true},
-		"extension-crlf": {"ext-0-foo sha256:" + strings.Repeat("b", 64) + "\r\nversion https://git-lfs.github.com/spec/v1\r\n" + strings.ReplaceAll(tail, "\n", "\r\n"), true},
-		"plain":          {"hello\n", false},
-		"prose":          {"see version https://git-lfs.github.com/spec/v1 for details\n", false},
-	}
-	for name, c := range cases {
-		t.Run(name, func(t *testing.T) {
-			dir := t.TempDir()
-			gitTest(t, dir, "init", "--bare")
-			cmd := exec.Command("git", "hash-object", "-w", "--stdin")
-			cmd.Dir = dir
-			cmd.Stdin = strings.NewReader(c.content)
-			out, err := cmd.CombinedOutput()
-			if err != nil {
-				t.Fatal(err, string(out))
-			}
-			gitTest(t, dir, "update-ref", "refs/tags/p", strings.TrimSpace(string(out)))
-			r := &replicator{ctx: context.Background(), timeout: time.Minute}
-			err = r.checkLFS(dir)
-			if c.want && (err == nil || !strings.Contains(err.Error(), "Git LFS pointers detected")) {
-				t.Fatalf("error = %v, want LFS detection", err)
-			}
-			if !c.want && err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-		})
+	if inv := lfsScanInv(t, dir); len(inv) == 0 {
+		t.Fatal("reachable pointer not inventoried")
 	}
 }
 
@@ -335,20 +294,20 @@ func paddedPointer(size int) []byte {
 	return []byte(p + strings.Repeat("\n", size-len(p)))
 }
 
-func wantLFS(t *testing.T, err error) {
+// lfsScanInv captures the current refs and returns the inventory, failing on a
+// scan error (a blocked or ambiguous pointer, or an invalid repository).
+func lfsScanInv(t *testing.T, dir string) lfsInventory {
 	t.Helper()
-	if err == nil || !strings.Contains(err.Error(), "Git LFS pointers detected") {
-		t.Fatalf("error = %v, want LFS detection", err)
+	r := &replicator{ctx: context.Background(), timeout: time.Minute}
+	refs, err := r.captureRefs(dir)
+	if err != nil {
+		t.Fatal(err)
 	}
-}
-
-func TestLFSPaddedPointerSizes(t *testing.T) {
-	for _, size := range []int{1023, 1024, 1025, 1027, 2127} {
-		t.Run(strconv.Itoa(size), func(t *testing.T) {
-			dir := lfsWorkRepo(t, map[string][]byte{"p.bin": paddedPointer(size)})
-			wantLFS(t, (&replicator{ctx: context.Background(), timeout: time.Minute}).checkLFS(dir))
-		})
+	inv, _, err := r.inventoryLFS(dir, refs)
+	if err != nil {
+		t.Fatal(err)
 	}
+	return inv
 }
 
 // A large binary blob without trailing LF must be drained exactly so the
@@ -361,17 +320,18 @@ func TestLFSFramingAfterLargeBlob(t *testing.T) {
 			big[i] = 0
 		}
 	}
-	r := &replicator{ctx: context.Background(), timeout: time.Minute}
 	plain := lfsWorkRepo(t, map[string][]byte{"a.bin": big, "b.txt": []byte("hi")})
-	if err := r.checkLFS(plain); err != nil {
-		t.Fatal(err)
+	if inv := lfsScanInv(t, plain); len(inv) != 0 {
+		t.Fatalf("plain inventory = %v, want empty", inv)
 	}
 	for _, packed := range []bool{false, true} {
 		dir := lfsWorkRepo(t, map[string][]byte{"a.bin": big, "z.ptr": paddedPointer(200)})
 		if packed {
 			gitTest(t, dir, "repack", "-adq")
 		}
-		wantLFS(t, r.checkLFS(dir))
+		if inv := lfsScanInv(t, dir); len(inv) == 0 {
+			t.Fatalf("packed=%v: pointer not inventoried", packed)
+		}
 	}
 }
 
@@ -386,7 +346,9 @@ func TestLFSIgnoresReplaceRefs(t *testing.T) {
 		t.Fatal(err)
 	}
 	gitTest(t, dir, "replace", pointer, strings.TrimSpace(string(out)))
-	wantLFS(t, (&replicator{ctx: context.Background(), timeout: time.Minute}).checkLFS(dir))
+	if inv := lfsScanInv(t, dir); len(inv) == 0 {
+		t.Fatal("pointer hidden by refs/replace was not inventoried")
+	}
 }
 
 func TestAtomicPushAndDryRun(t *testing.T) {
