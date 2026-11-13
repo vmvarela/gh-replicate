@@ -4,7 +4,7 @@ go 1.27
 
 require (
 	github.com/cli/go-gh/v2 v2.17.0
-	golang.org/x/sys v0.49.0
+	golang.org/x/sys v0.50.0
 )
 
 require (
